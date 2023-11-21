@@ -26,12 +26,13 @@ import {
     setCharacterName,
 } from "../script.js";
 import { getMessageTimeStamp } from "./RossAscends-mods.js";
-import { groups, resetSelectedGroup, selected_group } from "./group-chats.js";
+import { findGroupMemberId, is_group_generating, resetSelectedGroup, selected_group } from "./group-chats.js";
 import { getRegexedString, regex_placement } from "./extensions/regex/engine.js";
 import { chat_styles, power_user } from "./power-user.js";
 import { autoSelectPersona } from "./personas.js";
 import { getContext } from "./extensions.js";
 import { hideChatMessage, unhideChatMessage } from "./chats.js";
+import { stringToRange } from "./utils.js";
 export {
     executeSlashCommands,
     registerSlashCommand,
@@ -76,20 +77,22 @@ class SlashCommandParser {
         let unnamedArg;
 
         if (args.length > 0) {
-            const argsArray = args.split(' ');
-            for (let arg of argsArray) {
-                const equalsIndex = arg.indexOf('=');
-                if (equalsIndex !== -1) {
-                    const key = arg.substring(0, equalsIndex);
-                    const value = arg.substring(equalsIndex + 1);
-                    argObj[key] = value;
-                }
-                else {
-                    break;
-                }
+            // Match named arguments
+            const namedArgPattern = /(\w+)=("(?:\\.|[^"\\])*"|\S+)/g;
+            let match;
+            while ((match = namedArgPattern.exec(args)) !== null) {
+                const key = match[1];
+                const value = match[2];
+                // Remove the quotes around the value, if any
+                argObj[key] = value.replace(/(^")|("$)/g, '');
             }
 
-            unnamedArg = argsArray.slice(Object.keys(argObj).length).join(' ');
+            // Match unnamed argument
+            const unnamedArgPattern = /(?:\w+=(?:"(?:\\.|[^"\\])*"|\S+)\s*)*(.*)/s;
+            match = unnamedArgPattern.exec(args);
+            if (match !== null) {
+                unnamedArg = match[1].trim();
+            }
 
             // Excluded commands format in their own function
             if (!excludedFromRegex.includes(command)) {
@@ -129,8 +132,8 @@ parser.addCommand('?', helpCommandCallback, ['help'], ' – get help on macros, 
 parser.addCommand('name', setNameCallback, ['persona'], '<span class="monospace">(name)</span> – sets user name and persona avatar (if set)', true, true);
 parser.addCommand('sync', syncCallback, [], ' – syncs user name in user-attributed messages in the current chat', true, true);
 parser.addCommand('lock', bindCallback, ['bind'], ' – locks/unlocks a persona (name and avatar) to the current chat', true, true);
-parser.addCommand('bg', setBackgroundCallback, ['background'], '<span class="monospace">(filename)</span> – sets a background according to filename, partial names allowed, will set the first one alphabetically if multiple files begin with the provided argument string', false, true);
-parser.addCommand('sendas', sendMessageAs, [], ` – sends message as a specific character. Uses character avatar if it exists in the characters list. Example that will send "Hello, guys!" from "Chloe": <pre><code>/sendas Chloe&#10;Hello, guys!</code></pre>`, true, true);
+parser.addCommand('bg', setBackgroundCallback, ['background'], '<span class="monospace">(filename)</span> – sets a background according to filename, partial names allowed', false, true);
+parser.addCommand('sendas', sendMessageAs, [], ` – sends message as a specific character. Uses character avatar if it exists in the characters list. Example that will send "Hello, guys!" from "Chloe": <code>/sendas name="Chloe" Hello, guys!</code>`, true, true);
 parser.addCommand('sys', sendNarratorMessage, ['nar'], '<span class="monospace">(text)</span> – sends message as a system narrator', false, true);
 parser.addCommand('sysname', setNarratorName, [], '<span class="monospace">(name)</span> – sets a name for future system narrator messages in this chat (display only). Default: System. Leave empty to reset.', true, true);
 parser.addCommand('comment', sendCommentMessage, [], '<span class="monospace">(text)</span> – adds a note/comment message not part of the chat', false, true);
@@ -144,8 +147,10 @@ parser.addCommand('ask', askCharacter, [], '<span class="monospace">(prompt)</sp
 parser.addCommand('delname', deleteMessagesByNameCallback, ['cancel'], '<span class="monospace">(name)</span> – deletes all messages attributed to a specified name', true, true);
 parser.addCommand('send', sendUserMessageCallback, ['add'], '<span class="monospace">(text)</span> – adds a user message to the chat log without triggering a generation', true, true);
 parser.addCommand('trigger', triggerGroupMessageCallback, [], '<span class="monospace">(member index or name)</span> – triggers a message generation for the specified group member', true, true);
-parser.addCommand('hide', hideMessageCallback, [], '<span class="monospace">(message index)</span> – hides a chat message from the prompt', true, true);
-parser.addCommand('unhide', unhideMessageCallback, [], '<span class="monospace">(message index)</span> – unhides a message from the prompt', true, true);
+parser.addCommand('hide', hideMessageCallback, [], '<span class="monospace">(message index or range)</span> – hides a chat message from the prompt', true, true);
+parser.addCommand('unhide', unhideMessageCallback, [], '<span class="monospace">(message index or range)</span> – unhides a message from the prompt', true, true);
+parser.addCommand('disable', disableGroupMemberCallback, [], '<span class="monospace">(member index or name)</span> – disables a group member from being drafted for replies', true, true);
+parser.addCommand('enable', enableGroupMemberCallback, [], '<span class="monospace">(member index or name)</span> – enables a group member to be drafted for replies', true, true);
 
 const NARRATOR_NAME_KEY = 'narrator_name';
 const NARRATOR_NAME_DEFAULT = 'System';
@@ -239,15 +244,23 @@ async function hideMessageCallback(_, arg) {
         return;
     }
 
-    const messageId = Number(arg);
-    const messageBlock = $(`.mes[mesid="${messageId}"]`);
+    const range = stringToRange(arg, 0, chat.length - 1);
 
-    if (!messageBlock.length) {
-        console.warn(`WARN: No message found with ID ${messageId}`);
+    if (!range) {
+        console.warn(`WARN: Invalid range provided for /hide command: ${arg}`);
         return;
     }
 
-    await hideChatMessage(messageId, messageBlock);
+    for (let messageId = range.start; messageId <= range.end; messageId++) {
+        const messageBlock = $(`.mes[mesid="${messageId}"]`);
+
+        if (!messageBlock.length) {
+            console.warn(`WARN: No message found with ID ${messageId}`);
+            return;
+        }
+
+        await hideChatMessage(messageId, messageBlock);
+    }
 }
 
 async function unhideMessageCallback(_, arg) {
@@ -256,82 +269,79 @@ async function unhideMessageCallback(_, arg) {
         return;
     }
 
-    const messageId = Number(arg);
-    const messageBlock = $(`.mes[mesid="${messageId}"]`);
+    const range = stringToRange(arg, 0, chat.length - 1);
 
-    if (!messageBlock.length) {
-        console.warn(`WARN: No message found with ID ${messageId}`);
+    if (!range) {
+        console.warn(`WARN: Invalid range provided for /unhide command: ${arg}`);
         return;
     }
 
-    await unhideChatMessage(messageId, messageBlock);
+    for (let messageId = range.start; messageId <= range.end; messageId++) {
+        const messageBlock = $(`.mes[mesid="${messageId}"]`);
+
+        if (!messageBlock.length) {
+            console.warn(`WARN: No message found with ID ${messageId}`);
+            return;
+        }
+
+        await unhideChatMessage(messageId, messageBlock);
+    }
+}
+
+async function disableGroupMemberCallback(_, arg) {
+    if (!selected_group) {
+        toastr.warning("Cannot run /disable command outside of a group chat.");
+        return;
+    }
+
+    const chid = findGroupMemberId(arg);
+
+    if (chid === undefined) {
+        console.warn(`WARN: No group member found for argument ${arg}`);
+        return;
+    }
+
+    $(`.group_member[chid="${chid}"] [data-action="disable"]`).trigger('click');
+}
+
+async function enableGroupMemberCallback(_, arg) {
+    if (!selected_group) {
+        toastr.warning("Cannot run /enable command outside of a group chat.");
+        return;
+    }
+
+    const chid = findGroupMemberId(arg);
+
+    if (chid === undefined) {
+        console.warn(`WARN: No group member found for argument ${arg}`);
+        return;
+    }
+
+    $(`.group_member[chid="${chid}"] [data-action="enable"]`).trigger('click');
 }
 
 async function triggerGroupMessageCallback(_, arg) {
     if (!selected_group) {
-        toastr.warning("Cannot run this command outside of a group chat.");
+        toastr.warning("Cannot run /trigger command outside of a group chat.");
         return;
     }
 
-    arg = arg?.trim();
-
-    if (!arg) {
-        console.warn('WARN: No argument provided for /trigger command');
-        return;
-    }
-
-    const group = groups.find(x => x.id == selected_group);
-
-    if (!group || !Array.isArray(group.members)) {
-        console.warn('WARN: No group found for selected group ID');
+    if (is_group_generating) {
+        toastr.warning("Cannot run trigger command while the group reply is generating.");
         return;
     }
 
     // Prevent generate recursion
     $('#send_textarea').val('');
 
-    // Index is 1-based
-    const index = parseInt(arg) - 1;
-    const searchByName = isNaN(index);
+    const chid = findGroupMemberId(arg);
 
-    if (searchByName) {
-        const memberNames = group.members.map(x => ({ name: characters.find(y => y.avatar === x)?.name, index: characters.findIndex(y => y.avatar === x) }));
-        const fuse = new Fuse(memberNames, { keys: ['name'] });
-        const result = fuse.search(arg);
-
-        if (!result.length) {
-            console.warn(`WARN: No group member found with name ${arg}`);
-            return;
-        }
-
-        const chid = result[0].item.index;
-
-        if (chid === -1) {
-            console.warn(`WARN: No character found for group member ${arg}`);
-            return;
-        }
-
-        console.log(`Triggering group member ${chid} (${arg}) from search result`, result[0]);
-
-        Generate('normal', { force_chid: chid });
-    } else {
-        const memberAvatar = group.members[index];
-
-        if (memberAvatar === undefined) {
-            console.warn(`WARN: No group member found at index ${index}`);
-            return;
-        }
-
-        const chid = characters.findIndex(x => x.avatar === memberAvatar);
-
-        if (chid === -1) {
-            console.warn(`WARN: No character found for group member ${memberAvatar} at index ${index}`);
-            return;
-        }
-
-        console.log(`Triggering group member ${memberAvatar} at index ${index}`);
-        Generate('normal', { force_chid: chid });
+    if (chid === undefined) {
+        console.warn(`WARN: No group member found for argument ${arg}`);
+        return;
     }
+
+    Generate('normal', { force_chid: chid });
 }
 
 async function sendUserMessageCallback(_, text) {
@@ -342,7 +352,7 @@ async function sendUserMessageCallback(_, text) {
 
     text = text.trim();
     const bias = extractMessageBias(text);
-    sendMessageAsUser(text, bias);
+    await sendMessageAsUser(text, bias);
 }
 
 async function deleteMessagesByNameCallback(_, name) {
@@ -490,19 +500,32 @@ async function setNarratorName(_, text) {
     await saveChatConditional();
 }
 
-export async function sendMessageAs(_, text) {
+export async function sendMessageAs(namedArgs, text) {
     if (!text) {
         return;
     }
 
-    const parts = text.split('\n');
-    if (parts.length <= 1) {
-        toastr.warning('Both character name and message are required. Separate them with a new line.');
-        return;
-    }
+    let name;
+    let mesText;
 
-    const name = parts.shift().trim();
-    let mesText = parts.join('\n').trim();
+    if (namedArgs.name) {
+        name = namedArgs.name.trim();
+        mesText = text.trim();
+
+        if (!name && !text) {
+            toastr.warning('You must specify a name and text to send as');
+            return;
+        }
+    } else {
+        const parts = text.split('\n');
+        if (parts.length <= 1) {
+            toastr.warning('Both character name and message are required. Separate them with a new line.');
+            return;
+        }
+
+        name = parts.shift().trim();
+        mesText = parts.join('\n').trim();
+    }
 
     // Requires a regex check after the slash command is pushed to output
     mesText = getRegexedString(mesText, regex_placement.SLASH_COMMAND, { characterOverride: name });
@@ -686,11 +709,23 @@ function setBackgroundCallback(_, bg) {
     if (!bg) {
         return;
     }
-    console.log('Set background to ' + bg);
-    const bgElement = $(`.bg_example[bgfile^="${bg.trim()}"`);
 
-    if (bgElement.length) {
-        bgElement.get(0).click();
+    console.log('Set background to ' + bg);
+
+    const bgElements = Array.from(document.querySelectorAll(`.bg_example`)).map((x) => ({ element: x, bgfile: x.getAttribute('bgfile') }));
+
+    const fuse = new Fuse(bgElements, { keys: ['bgfile'] });
+    const result = fuse.search(bg);
+
+    if (!result.length) {
+        toastr.error(`No background found with name "${bg}"`);
+        return;
+    }
+
+    const bgElement = result[0].item.element;
+
+    if (bgElement instanceof HTMLElement) {
+        bgElement.click();
     }
 }
 

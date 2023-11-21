@@ -72,6 +72,11 @@ if (process.versions && process.versions.node && process.versions.node.match(/20
 dns.setDefaultResultOrder('ipv4first');
 
 const cliArguments = yargs(hideBin(process.argv))
+    .option('autorun', {
+        type: 'boolean',
+        default: null,
+        describe: 'Automatically launch SillyTavern in the browser.'
+    })
     .option('disableCsrf', {
         type: 'boolean',
         default: false,
@@ -116,7 +121,7 @@ if (fs.existsSync(whitelistPath)) {
 }
 
 const whitelistMode = config.whitelistMode;
-const autorun = config.autorun && !cliArguments.ssl;
+const autorun = config.autorun && cliArguments.autorun!==false && !cliArguments.ssl;
 const enableExtensions = config.enableExtensions;
 const listen = config.listen;
 
@@ -164,6 +169,15 @@ function getAphroditeHeaders() {
     }) : {};
 }
 
+function getTabbyHeaders() {
+    const apiKey = readSecret(SECRET_KEYS.TABBY)
+
+    return apiKey ? ({
+        "x-api-key": apiKey,
+        "Authorization": `Bearer ${apiKey}`,
+    }) : {};
+}
+
 function getOverrideHeaders(urlHost) {
     const overrideHeaders = config.requestOverrides?.find((e) => e.hosts?.includes(urlHost))?.headers;
     if (overrideHeaders && urlHost) {
@@ -186,6 +200,8 @@ function setAdditionalHeaders(request, args, server) {
         headers = getMancerHeaders();
     } else if (request.body.use_aphrodite) {
         headers = getAphroditeHeaders();
+    } else if (request.body.use_tabby) {
+        headers = getTabbyHeaders();
     } else {
         headers = server ? getOverrideHeaders((new URL(server))?.host) : {};
     }
@@ -506,6 +522,7 @@ app.post("/api/textgenerationwebui/status", jsonParser, async function (request,
         setAdditionalHeaders(request, args, baseUrl);
 
         let url = baseUrl;
+        let result = '';
 
         if (request.body.legacy_api) {
             url += "/v1/model";
@@ -518,6 +535,12 @@ app.post("/api/textgenerationwebui/status", jsonParser, async function (request,
         }
         else if (request.body.use_mancer) {
             url += "/oai/v1/models";
+        }
+        else if (request.body.use_tabby) {
+            url += "/v1/model/list"
+        }
+        else if (request.body.use_koboldcpp) {
+            url += "/v1/models";
         }
 
         const modelsReply = await fetch(url, args);
@@ -542,7 +565,43 @@ app.post("/api/textgenerationwebui/status", jsonParser, async function (request,
         const modelIds = data.data.map(x => x.id);
         console.log('Models available:', modelIds);
 
-        const result = modelIds[0] ?? 'Valid';
+        // Set result to the first model ID
+        result = modelIds[0] || 'Valid';
+
+        if (request.body.use_ooba) {
+            try {
+                const modelInfoUrl = baseUrl + "/v1/internal/model/info";
+                const modelInfoReply = await fetch(modelInfoUrl, args);
+
+                if (modelInfoReply.ok) {
+                    const modelInfo = await modelInfoReply.json();
+                    console.log('Ooba model info:', modelInfo);
+
+                    const modelName = modelInfo?.model_name;
+                    result = modelName || result;
+                }
+            } catch (error) {
+                console.error(`Failed to get Ooba model info: ${error}`);
+            }
+        }
+
+        if (request.body.use_tabby) {
+            try {
+                const modelInfoUrl = baseUrl + "/v1/model";
+                const modelInfoReply = await fetch(modelInfoUrl, args);
+
+                if (modelInfoReply.ok) {
+                    const modelInfo = await modelInfoReply.json();
+                    console.log('Tabby model info:', modelInfo);
+
+                    const modelName = modelInfo?.id;
+                    result = modelName || result;
+                }
+            } catch (error) {
+                console.error(`Failed to get TabbyAPI model info: ${error}`);
+            }
+        }
+
         return response.send({ result, data: data.data });
     } catch (error) {
         console.error(error);
@@ -573,7 +632,7 @@ app.post("/api/textgenerationwebui/generate", jsonParser, async function (reques
         if (request.body.legacy_api) {
             url += "/v1/generate";
         }
-        else if (request.body.use_aphrodite || request.body.use_ooba) {
+        else if (request.body.use_aphrodite || request.body.use_ooba || request.body.use_tabby || request.body.use_koboldcpp) {
             url += "/v1/completions";
         }
         else if (request.body.use_mancer) {
@@ -2437,27 +2496,28 @@ app.post('/uploadimage', jsonParser, async (request, response) => {
         return response.status(400).send({ error: "No image data provided" });
     }
 
-    // Extracting the base64 data and the image format
-    const match = request.body.image.match(/^data:image\/(png|jpg|webp|jpeg|gif);base64,(.+)$/);
-    if (!match) {
-        return response.status(400).send({ error: "Invalid image format" });
-    }
-
-    const [, format, base64Data] = match;
-
-    // Constructing filename and path
-    let filename = `${Date.now()}.${format}`;
-    if (request.body.filename) {
-        filename = `${request.body.filename}.${format}`;
-    }
-
-    // if character is defined, save to a sub folder for that character
-    let pathToNewFile = path.join(DIRECTORIES.userImages, filename);
-    if (request.body.ch_name) {
-        pathToNewFile = path.join(DIRECTORIES.userImages, request.body.ch_name, filename);
-    }
-
     try {
+        // Extracting the base64 data and the image format
+        const splitParts = request.body.image.split(',');
+        const format = splitParts[0].split(';')[0].split('/')[1];
+        const base64Data = splitParts[1];
+        const validFormat = ['png', 'jpg', 'webp', 'jpeg', 'gif'].includes(format);
+        if (!validFormat) {
+            return response.status(400).send({ error: "Invalid image format" });
+        }
+
+        // Constructing filename and path
+        let filename = `${Date.now()}.${format}`;
+        if (request.body.filename) {
+            filename = `${request.body.filename}.${format}`;
+        }
+
+        // if character is defined, save to a sub folder for that character
+        let pathToNewFile = path.join(DIRECTORIES.userImages, filename);
+        if (request.body.ch_name) {
+            pathToNewFile = path.join(DIRECTORIES.userImages, request.body.ch_name, filename);
+        }
+
         ensureDirectoryExistence(pathToNewFile);
         const imageBuffer = Buffer.from(base64Data, 'base64');
         await fs.promises.writeFile(pathToNewFile, imageBuffer);
@@ -2723,7 +2783,7 @@ app.post("/getstatus_openai", jsonParser, async function (request, response_gets
 
                 data.data.forEach(model => {
                     const context_length = model.context_length;
-                    const tokens_dollar = Number(1 / (1000 * model.pricing.prompt));
+                    const tokens_dollar = Number(1 / (1000 * model.pricing?.prompt));
                     const tokens_rounded = (Math.round(tokens_dollar * 1000) / 1000).toFixed(0);
                     models[model.id] = {
                         tokens_per_dollar: tokens_rounded + 'k',
@@ -2744,8 +2804,8 @@ app.post("/getstatus_openai", jsonParser, async function (request, response_gets
             }
         }
         else {
-            console.log('Access Token is incorrect.');
-            response_getstatus_openai.send({ error: true });
+            console.log('OpenAI status check failed. Either Access Token is incorrect or API endpoint is down.');
+            response_getstatus_openai.send({ error: true, can_bypass: true, data: { data: [] } });
         }
     } catch (e) {
         console.error(e);
@@ -2775,12 +2835,12 @@ app.post("/openai_bias", jsonParser, async function (request, response) {
 
         if (sentencepieceTokenizers.includes(model)) {
             const tokenizer = getSentencepiceTokenizer(model);
-            encodeFunction = (text) => new Uint32Array(tokenizer.encodeIds(text));
+            const instance = await tokenizer?.get();
+            encodeFunction = (text) => new Uint32Array(instance?.encodeIds(text));
         } else {
             const tokenizer = getTiktokenTokenizer(model);
             encodeFunction = (tokenizer.encode.bind(tokenizer));
         }
-
 
         for (const entry of request.body) {
             if (!entry || !entry.text) {
@@ -3102,7 +3162,20 @@ async function sendPalmRequest(request, response) {
         }
 
         const generateResponseJson = await generateResponse.json();
-        const responseText = generateResponseJson.candidates[0]?.output;
+        const responseText = generateResponseJson?.candidates[0]?.output;
+
+        if (!responseText) {
+            console.log('Palm API returned no response', generateResponseJson);
+            let message = `Palm API returned no response: ${JSON.stringify(generateResponseJson)}`;
+
+            // Check for filters
+            if (generateResponseJson?.filters[0]?.message) {
+                message = `Palm filter triggered: ${generateResponseJson.filters[0].message}`;
+            }
+
+            return response.send({ error: { message } });
+        }
+
         console.log('Palm response:', responseText);
 
         // Wrap it back to OAI format
@@ -3364,8 +3437,7 @@ app.post("/tokenize_via_api", jsonParser, async function (request, response) {
         if (api == 'textgenerationwebui') {
             const args = {
                 method: 'POST',
-                body: JSON.stringify({ "prompt": text }),
-                headers: { "Content-Type": "application/json" }
+                headers: { "Content-Type": "application/json" },
             };
 
             setAdditionalHeaders(request, args, null);
@@ -3375,9 +3447,19 @@ app.post("/tokenize_via_api", jsonParser, async function (request, response) {
 
             if (legacyApi) {
                 url += '/v1/token-count';
-
-            } else {
-                url += '/api/v1/token-count';
+                args.body = JSON.stringify({ "prompt": text });
+            }
+            else if (request.body.use_tabby) {
+                url += '/v1/token/encode';
+                args.body = JSON.stringify({ "text": text });
+            }
+            else if (request.body.use_koboldcpp) {
+                url += '/api/extra/tokencount';
+                args.body = JSON.stringify({ "prompt": text });
+            }
+            else {
+                url += '/v1/internal/encode';
+                args.body = JSON.stringify({ "text": text });
             }
 
             const result = await fetch(url, args);
@@ -3388,7 +3470,10 @@ app.post("/tokenize_via_api", jsonParser, async function (request, response) {
             }
 
             const data = await result.json();
-            return response.send({ count: data['results'][0]['tokens'] });
+            const count = legacyApi ? data?.results[0]?.tokens : (data?.length ?? data?.value);
+            const ids = legacyApi ? [] : (data?.tokens ?? []);
+
+            return response.send({ count, ids });
         }
 
         else if (api == 'kobold') {
@@ -3410,7 +3495,7 @@ app.post("/tokenize_via_api", jsonParser, async function (request, response) {
 
             const data = await result.json();
             const count = data['value'];
-            return response.send({ count: count });
+            return response.send({ count: count, ids: [] });
         }
 
         else {
@@ -3445,7 +3530,7 @@ async function fetchJSON(url, args = {}) {
 // ** END **
 
 // OpenAI API
-require('./src/openai').registerEndpoints(app, jsonParser);
+require('./src/openai').registerEndpoints(app, jsonParser, urlencodedParser);
 
 // Tokenizers
 require('./src/tokenizers').registerEndpoints(app, jsonParser);
@@ -3491,6 +3576,9 @@ require('./src/classify').registerEndpoints(app, jsonParser);
 
 // Image captioning
 require('./src/caption').registerEndpoints(app, jsonParser);
+
+// Web search extension
+require('./src/serpapi').registerEndpoints(app, jsonParser);
 
 const tavernUrl = new URL(
     (cliArguments.ssl ? 'https://' : 'http://') +
@@ -3601,7 +3689,7 @@ function backupChat(name, chat) {
         // replace non-alphanumeric characters with underscores
         name = sanitize(name).replace(/[^a-z0-9]/gi, '_').toLowerCase();
 
-        const backupFile = path.join(DIRECTORIES.backups, `chat_${name}_${generateTimestamp()}.json`);
+        const backupFile = path.join(DIRECTORIES.backups, `chat_${name}_${generateTimestamp()}.jsonl`);
         writeFileAtomicSync(backupFile, chat, 'utf-8');
 
         removeOldBackups(`chat_${name}_`);

@@ -1,4 +1,4 @@
-import { callPopup, cancelTtsPlay, eventSource, event_types, saveSettingsDebounced } from '../../../script.js'
+import { callPopup, cancelTtsPlay, eventSource, event_types, name2, saveSettingsDebounced } from '../../../script.js'
 import { ModuleWorkerWrapper, doExtrasFetch, extension_settings, getApiUrl, getContext, modules } from '../../extensions.js'
 import { escapeRegex, getStringHash } from '../../utils.js'
 import { EdgeTtsProvider } from './edge.js'
@@ -8,6 +8,8 @@ import { CoquiTtsProvider } from './coqui.js'
 import { SystemTtsProvider } from './system.js'
 import { NovelTtsProvider } from './novel.js'
 import { power_user } from '../../power-user.js'
+import { registerSlashCommand } from '../../slash-commands.js'
+import { OpenAITtsProvider } from './openai.js'
 export { talkingAnimation };
 
 const UPDATE_INTERVAL = 1000
@@ -72,9 +74,12 @@ let ttsProviders = {
     Coqui: CoquiTtsProvider,
     Edge: EdgeTtsProvider,
     Novel: NovelTtsProvider,
+    OpenAI: OpenAITtsProvider,
 }
 let ttsProvider
 let ttsProviderName
+
+let ttsLastMessage = null;
 
 async function onNarrateOneMessage() {
     audioElement.src = '/sounds/silence.mp3';
@@ -89,6 +94,36 @@ async function onNarrateOneMessage() {
     resetTtsPlayback()
     ttsJobQueue.push(message);
     moduleWorker();
+}
+
+async function onNarrateText(args, text) {
+    if (!text) {
+        return;
+    }
+
+    audioElement.src = '/sounds/silence.mp3';
+
+    // To load all characters in the voice map, set unrestricted to true
+    await initVoiceMap(true);
+
+    const baseName = args?.voice || name2;
+    const name = (baseName === 'SillyTavern System' ? DEFAULT_VOICE_MARKER : baseName) || DEFAULT_VOICE_MARKER;
+
+    const voiceMapEntry = voiceMap[name] === DEFAULT_VOICE_MARKER
+        ? voiceMap[DEFAULT_VOICE_MARKER]
+        : voiceMap[name];
+
+    if (!voiceMapEntry || voiceMapEntry === DISABLED_VOICE_MARKER) {
+        toastr.info(`Specified voice for ${name} was not found. Check the TTS extension settings.`);
+        return;
+    }
+
+    resetTtsPlayback()
+    ttsJobQueue.push({ mes: text, name: name });
+    await moduleWorker();
+
+    // Return back to the chat voices
+    await initVoiceMap(false);
 }
 
 async function moduleWorker() {
@@ -132,26 +167,43 @@ async function moduleWorker() {
     }
 
     // take the count of messages
-    let lastMessageNumber = context.chat.length ? context.chat.length : 0
+    let lastMessageNumber = context.chat.length ? context.chat.length : 0;
 
     // There's no new messages
-    let diff = lastMessageNumber - currentMessageNumber
-    let hashNew = getStringHash((chat.length && chat[chat.length - 1].mes) ?? '')
+    let diff = lastMessageNumber - currentMessageNumber;
+    let hashNew = getStringHash((chat.length && chat[chat.length - 1].mes) ?? '');
 
-    if (diff == 0 && hashNew === lastMessageHash) {
-        return
+    // if messages got deleted, diff will be < 0
+    if (diff < 0) {
+        // necessary actions will be taken by the onChatDeleted() handler
+        return;
     }
 
-    const message = chat[chat.length - 1]
+    // if no new messages, or same message, or same message hash, do nothing
+    if (diff == 0 && hashNew === lastMessageHash) {
+        return;
+    }
 
-    // We're currently swiping or streaming. Don't generate voice
-    if (
-        !message ||
-        message.mes === '...' ||
-        message.mes === '' ||
-        (context.streamingProcessor && !context.streamingProcessor.isFinished)
-    ) {
-        return
+    // If streaming, wait for streaming to finish before processing new messages
+    if (context.streamingProcessor && !context.streamingProcessor.isFinished) {
+        return;
+    }
+
+    // clone message object, as things go haywire if message object is altered below (it's passed by reference)
+    const message = structuredClone(chat[chat.length - 1]);
+
+    // if last message within current message, message got extended. only send diff to TTS.
+    if (ttsLastMessage !== null && message.mes.indexOf(ttsLastMessage) !== -1) {
+        let tmp = message.mes;
+        message.mes = message.mes.replace(ttsLastMessage, '');
+        ttsLastMessage = tmp;
+    } else {
+        ttsLastMessage = message.mes;
+    }
+
+    // We're currently swiping. Don't generate voice
+    if (!message || message.mes === '...' || message.mes === '') {
+        return;
     }
 
     // Don't generate if message doesn't have a display text
@@ -252,6 +304,7 @@ window.debugTtsPlayback = debugTtsPlayback
 //##################//
 
 let audioElement = new Audio()
+audioElement.id = 'tts_audio'
 audioElement.autoplay = true
 
 let audioJobQueue = []
@@ -402,7 +455,7 @@ let currentTtsJob // Null if nothing is currently being processed
 let currentMessageNumber = 0
 
 function completeTtsJob() {
-    console.info(`Current TTS job for ${currentTtsJob.name} completed.`)
+    console.info(`Current TTS job for ${currentTtsJob?.name} completed.`)
     currentTtsJob = null
 }
 
@@ -634,12 +687,44 @@ export function saveTtsProviderSettings() {
 async function onChatChanged() {
     await resetTtsPlayback()
     await initVoiceMap()
+    ttsLastMessage = null
 }
 
-function getCharacters(){
+async function onChatDeleted() {
     const context = getContext()
+
+    // update internal references to new last message
+    lastChatId = context.chatId
+    currentMessageNumber = context.chat.length ? context.chat.length : 0
+
+    // compare against lastMessageHash. If it's the same, we did not delete the last chat item, so no need to reset tts queue
+    let messageHash = getStringHash((context.chat.length && context.chat[context.chat.length - 1].mes) ?? '')
+    if (messageHash === lastMessageHash) {
+        return
+    }
+    lastMessageHash = messageHash
+    ttsLastMessage = (context.chat.length && context.chat[context.chat.length - 1].mes) ?? '';
+
+    // stop any tts playback since message might not exist anymore
+    await resetTtsPlayback()
+}
+
+/**
+ * Get characters in current chat
+ * @param {boolean} unrestricted - If true, will include all characters in voiceMapEntries, even if they are not in the current chat.
+ * @returns {string[]} - Array of character names
+ */
+function getCharacters(unrestricted) {
+    const context = getContext()
+
+    if (unrestricted) {
+        const names = context.characters.map(char => char.name);
+        names.unshift(DEFAULT_VOICE_MARKER);
+        return names;
+    }
+
     let characters = []
-    if (context.groupId === null){
+    if (context.groupId === null) {
         // Single char chat
         characters.push(DEFAULT_VOICE_MARKER)
         characters.push(context.name1)
@@ -651,7 +736,7 @@ function getCharacters(){
         const group = context.groups.find(group => context.groupId == group.id)
         for (let member of group.members) {
             // Remove suffix
-            if (member.endsWith('.png')){
+            if (member.endsWith('.png')) {
                 member = member.slice(0, -4)
             }
             characters.push(member)
@@ -661,15 +746,15 @@ function getCharacters(){
 }
 
 function sanitizeId(input) {
-  // Remove any non-alphanumeric characters except underscore (_) and hyphen (-)
-  let sanitized = input.replace(/[^a-zA-Z0-9-_]/g, '');
+    // Remove any non-alphanumeric characters except underscore (_) and hyphen (-)
+    let sanitized = input.replace(/[^a-zA-Z0-9-_]/g, '');
 
-  // Ensure first character is always a letter
-  if (!/^[a-zA-Z]/.test(sanitized)) {
-    sanitized = 'element_' + sanitized;
-  }
+    // Ensure first character is always a letter
+    if (!/^[a-zA-Z]/.test(sanitized)) {
+        sanitized = 'element_' + sanitized;
+    }
 
-  return sanitized;
+    return sanitized;
 }
 
 function parseVoiceMap(voiceMapString) {
@@ -691,13 +776,13 @@ function parseVoiceMap(voiceMapString) {
  */
 function updateVoiceMap() {
     const tempVoiceMap = {}
-    for (const voice of voiceMapEntries){
-        if (voice.voiceId === null){
+    for (const voice of voiceMapEntries) {
+        if (voice.voiceId === null) {
             continue
         }
         tempVoiceMap[voice.name] = voice.voiceId
     }
-    if (Object.keys(tempVoiceMap).length !== 0){
+    if (Object.keys(tempVoiceMap).length !== 0) {
         voiceMap = tempVoiceMap
         console.log(`Voicemap updated to ${JSON.stringify(voiceMap)}`)
     }
@@ -712,13 +797,13 @@ class VoiceMapEntry {
     name
     voiceId
     selectElement
-    constructor (name, voiceId=DEFAULT_VOICE_MARKER) {
+    constructor(name, voiceId = DEFAULT_VOICE_MARKER) {
         this.name = name
         this.voiceId = voiceId
         this.selectElement = null
     }
 
-    addUI(voiceIds){
+    addUI(voiceIds) {
         let sanitizedName = sanitizeId(this.name)
         let defaultOption = this.name === DEFAULT_VOICE_MARKER ?
             `<option>${DISABLED_VOICE_MARKER}</option>` :
@@ -734,7 +819,7 @@ class VoiceMapEntry {
         $('#tts_voicemap_block').append(template)
 
         // Populate voice ID select list
-        for (const voiceId of voiceIds){
+        for (const voiceId of voiceIds) {
             const option = document.createElement('option');
             option.innerText = voiceId.name;
             option.value = voiceId.name;
@@ -754,12 +839,12 @@ class VoiceMapEntry {
 
 /**
  * Init voiceMapEntries for character select list.
- *
+ * @param {boolean} unrestricted - If true, will include all characters in voiceMapEntries, even if they are not in the current chat.
  */
-export async function initVoiceMap(){
+export async function initVoiceMap(unrestricted = false) {
     // Gate initialization if not enabled or TTS Provider not ready. Prevents error popups.
     const enabled = $('#tts_enabled').is(':checked')
-    if (!enabled){
+    if (!enabled) {
         return
     }
 
@@ -779,16 +864,16 @@ export async function initVoiceMap(){
     voiceMapEntries = []
 
     // Get characters in current chat
-    const characters = getCharacters()
+    const characters = getCharacters(unrestricted);
 
     // Get saved voicemap from provider settings, handling new and old representations
     let voiceMapFromSettings = {}
     if ("voiceMap" in extension_settings.tts[ttsProviderName]) {
         // Handle previous representation
-        if (typeof extension_settings.tts[ttsProviderName].voiceMap === "string"){
+        if (typeof extension_settings.tts[ttsProviderName].voiceMap === "string") {
             voiceMapFromSettings = parseVoiceMap(extension_settings.tts[ttsProviderName].voiceMap)
-        // Handle new representation
-        } else if (typeof extension_settings.tts[ttsProviderName].voiceMap === "object"){
+            // Handle new representation
+        } else if (typeof extension_settings.tts[ttsProviderName].voiceMap === "object") {
             voiceMapFromSettings = extension_settings.tts[ttsProviderName].voiceMap
         }
     }
@@ -803,13 +888,13 @@ export async function initVoiceMap(){
     }
 
     // Build UI using VoiceMapEntry objects
-    for (const character of characters){
-        if (character === "SillyTavern System"){
+    for (const character of characters) {
+        if (character === "SillyTavern System") {
             continue
         }
         // Check provider settings for voiceIds
         let voiceId
-        if (character in voiceMapFromSettings){
+        if (character in voiceMapFromSettings) {
             voiceId = voiceMapFromSettings[character]
         } else if (character === DEFAULT_VOICE_MARKER) {
             voiceId = DISABLED_VOICE_MARKER
@@ -903,5 +988,8 @@ $(document).ready(function () {
     setInterval(wrapper.update.bind(wrapper), UPDATE_INTERVAL) // Init depends on all the things
     eventSource.on(event_types.MESSAGE_SWIPED, resetTtsPlayback);
     eventSource.on(event_types.CHAT_CHANGED, onChatChanged)
+    eventSource.on(event_types.MESSAGE_DELETED, onChatDeleted);
     eventSource.on(event_types.GROUP_UPDATED, onChatChanged)
+    registerSlashCommand('speak', onNarrateText, ['narrate', 'tts'], `<span class="monospace">(text)</span>  – narrate any text using currently selected character's voice. Use voice="Character Name" argument to set other voice from the voice map, example: <tt>/speak voice="Donald Duck" Quack!</tt>`, true, true);
+    document.body.appendChild(audioElement);
 })

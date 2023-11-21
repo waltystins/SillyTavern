@@ -19,10 +19,12 @@ import {
     getTextGenUrlSourceId,
     isMancer,
     isAphrodite,
+    isTabby,
     textgen_types,
     textgenerationwebui_banned_in_macros,
     isOoba,
     MANCER_SERVER,
+    isKoboldCpp,
 } from "./scripts/textgen-settings.js";
 
 import {
@@ -143,6 +145,8 @@ import {
     escapeRegex,
     resetScrollHeight,
     onlyUnique,
+    getBase64Async,
+    humanFileSize,
 } from "./scripts/utils.js";
 
 import { ModuleWorkerWrapper, doDailyExtensionUpdatesCheck, extension_settings, getContext, loadExtensionSettings, processExtensionHelpers, registerExtensionHelper, renderExtensionTemplate, runGenerationInterceptors, saveMetadataDebounced } from "./scripts/extensions.js";
@@ -184,11 +188,12 @@ import {
 } from "./scripts/instruct-mode.js";
 import { applyLocale } from "./scripts/i18n.js";
 import { getFriendlyTokenizerName, getTokenCount, getTokenizerModel, initTokenizers, saveTokenCache } from "./scripts/tokenizers.js";
-import { initPersonas, selectCurrentPersona, setPersonaDescription } from "./scripts/personas.js";
+import { createPersona, initPersonas, selectCurrentPersona, setPersonaDescription } from "./scripts/personas.js";
 import { getBackgrounds, initBackgrounds } from "./scripts/backgrounds.js";
 import { hideLoader, showLoader } from "./scripts/loader.js";
 import { CharacterContextMenu, BulkEditOverlay } from "./scripts/BulkEditOverlay.js";
 import { loadMancerModels } from "./scripts/mancer-settings.js";
+import { hasPendingFileAttachment, populateFileAttachment } from "./scripts/chats.js";
 
 //exporting functions and vars for mods
 export {
@@ -313,11 +318,6 @@ export const event_types = {
 
 export const eventSource = new EventEmitter();
 
-// Check for override warnings every 5 seconds...
-setInterval(displayOverrideWarnings, 5000);
-// ...or when the chat changes
-eventSource.on(event_types.SETTINGS_LOADED, () => { settingsReady = true; });
-eventSource.on(event_types.CHAT_CHANGED, displayOverrideWarnings);
 eventSource.on(event_types.MESSAGE_RECEIVED, processExtensionHelpers);
 eventSource.on(event_types.MESSAGE_SENT, processExtensionHelpers);
 
@@ -647,7 +647,7 @@ let create_save = {
 };
 
 //animation right menu
-let animation_duration = 125;
+export let animation_duration = 125;
 let animation_easing = "ease-in-out";
 let popup_type = "";
 let chat_file_for_del = "";
@@ -658,7 +658,7 @@ let api_server_textgenerationwebui = "";
 
 let is_send_press = false; //Send generation
 
-let this_del_mes = 0;
+let this_del_mes = -1;
 
 //message editing and chat scroll position persistence
 var this_edit_mes_text = "";
@@ -729,7 +729,7 @@ async function firstLoadInit() {
     sendSystemMessage(system_message_types.WELCOME);
     await readSecretState();
     await getClientVersion();
-    await getSettings("def");
+    await getSettings();
     await getUserAvatars();
     await getCharacters();
     await getBackgrounds();
@@ -886,6 +886,8 @@ async function getStatus() {
                 use_mancer: main_api == "textgenerationwebui" ? isMancer() : false,
                 use_aphrodite: main_api == "textgenerationwebui" ? isAphrodite() : false,
                 use_ooba: main_api == "textgenerationwebui" ? isOoba() : false,
+                use_tabby: main_api == "textgenerationwebui" ? isTabby() : false,
+                use_koboldcpp: main_api == "textgenerationwebui" ? isKoboldCpp() : false,
                 legacy_api: main_api == "textgenerationwebui" ? textgenerationwebui_settings.legacy_api && !isMancer() : false,
             }),
             signal: abortStatusCheck.signal,
@@ -926,12 +928,12 @@ async function getStatus() {
 
 export function startStatusLoading() {
     $(".api_loading").show();
-    $(".api_button").attr("disabled", "disabled").addClass("disabled");
+    $(".api_button").addClass("disabled");
 }
 
 export function stopStatusLoading() {
     $(".api_loading").hide();
-    $(".api_button").removeAttr("disabled").removeClass("disabled");
+    $(".api_button").removeClass("disabled");
 }
 
 export function resultCheckStatus() {
@@ -989,6 +991,41 @@ export async function selectCharacterById(id) {
     }
 }
 
+function getTagBlock(item, entities) {
+    let count = 0;
+
+    for (const entity of entities) {
+        if (entitiesFilter.isElementTagged(entity, item.id)) {
+            count++;
+        }
+    }
+
+    const template = $('#bogus_folder_template .bogus_folder_select').clone();
+    template.attr({ 'tagid': item.id, 'id': `BogusFolder${item.id}` });
+    template.find('.avatar').css({ 'background-color': item.color, 'color': item.color2 });
+    template.find('.ch_name').text(item.name);
+    template.find('.bogus_folder_counter').text(count);
+    return template;
+}
+
+function getBackBlock() {
+    const template = $('#bogus_folder_back_template .bogus_folder_select').clone();
+    return template;
+}
+
+function getEmptyBlock() {
+    const icons = ['fa-dragon', 'fa-otter', 'fa-kiwi-bird', 'fa-crow', 'fa-frog'];
+    const texts = ['Here be dragons', 'Otterly empty', 'Kiwibunga', 'Pump-a-Rum', 'Croak it'];
+    const roll = new Date().getMinutes() % icons.length;
+    const emptyBlock = `
+    <div class="empty_block">
+        <i class="fa-solid ${icons[roll]} fa-4x"></i>
+        <h1>${texts[roll]}</h1>
+        <p>There are no items to display.</p>
+    </div>`;
+    return $(emptyBlock);
+}
+
 function getCharacterBlock(item, id) {
     let this_avatar = default_avatar;
     if (item.avatar != "none") {
@@ -1015,9 +1052,10 @@ function getCharacterBlock(item, id) {
         template.find('.ch_description').hide();
     }
 
-    const version = item.data?.character_version || '';
-    if (version) {
-        template.find('.character_version').text(version);
+    const auxFieldName = power_user.aux_field || 'character_version';
+    const auxFieldValue = (item.data && item.data[auxFieldName]) || '';
+    if (auxFieldValue) {
+        template.find('.character_version').text(auxFieldValue);
     }
     else {
         template.find('.character_version').hide();
@@ -1038,13 +1076,20 @@ async function printCharacters(fullRefresh = false) {
         printTagFilters(tag_filter_types.character);
         printTagFilters(tag_filter_types.group_member);
 
+        // Return to main list
+        if (isBogusFolderOpen()) {
+            entitiesFilter.setFilterData(FILTER_TYPES.TAG, { excluded: [], selected: [] });
+        }
+
         await delay(1);
-        displayOverrideWarnings();
     }
 
     const storageKey = 'Characters_PerPage';
+    const listId = '#rm_print_characters_block';
+    const entities = getEntitiesList({ doFilter: true });
+
     $("#rm_print_characters_pagination").pagination({
-        dataSource: getEntitiesList({ doFilter: true }),
+        dataSource: entities,
         pageSize: Number(localStorage.getItem(storageKey)) || per_page_default,
         sizeChangerOptions: [10, 25, 50, 100, 250, 500, 1000],
         pageRange: 1,
@@ -1057,13 +1102,24 @@ async function printCharacters(fullRefresh = false) {
         formatNavigator: PAGINATION_TEMPLATE,
         showNavigator: true,
         callback: function (data) {
-            $("#rm_print_characters_block").empty();
+            $(listId).empty();
+            if (isBogusFolderOpen()) {
+                $(listId).append(getBackBlock());
+            }
+            if (!data.length) {
+                $(listId).append(getEmptyBlock());
+            }
             for (const i of data) {
-                if (i.type === 'character') {
-                    $("#rm_print_characters_block").append(getCharacterBlock(i.item, i.id));
-                }
-                if (i.type === 'group') {
-                    $("#rm_print_characters_block").append(getGroupBlock(i.item));
+                switch (i.type) {
+                    case 'character':
+                        $(listId).append(getCharacterBlock(i.item, i.id));
+                        break;
+                    case 'group':
+                        $(listId).append(getGroupBlock(i.item));
+                        break;
+                    case 'tag':
+                        $(listId).append(getTagBlock(i.item, entities));
+                        break;
                 }
             }
             eventSource.emit(event_types.CHARACTER_PAGE_LOADED);
@@ -1075,20 +1131,58 @@ async function printCharacters(fullRefresh = false) {
             saveCharactersPage = e;
         },
         afterRender: function () {
-            $('#rm_print_characters_block').scrollTop(0);
+            $(listId).scrollTop(0);
         },
     });
 
     favsToHotswap();
 }
 
+/**
+ * Indicates whether a user is currently in a bogus folder.
+ * @returns {boolean} If currently viewing a folder
+ */
+function isBogusFolderOpen() {
+    return !!entitiesFilter.getFilterData(FILTER_TYPES.TAG)?.bogus;
+}
+
 export function getEntitiesList({ doFilter } = {}) {
-    let entities = [];
-    entities.push(...characters.map((item, index) => ({ item, id: index, type: 'character' })));
-    entities.push(...groups.map((item) => ({ item, id: item.id, type: 'group' })));
+    function characterToEntity(character, id) {
+        return { item: character, id, type: 'character' };
+    }
+
+    function groupToEntity(group) {
+        return { item: group, id: group.id, type: 'group' };
+    }
+
+    function tagToEntity(tag) {
+        return { item: structuredClone(tag), id: tag.id, type: 'tag' };
+    }
+
+    let entities = [
+        ...characters.map((item, index) => characterToEntity(item, index)),
+        ...groups.map(item => groupToEntity(item)),
+        ...(power_user.bogus_folders ? tags.map(item => tagToEntity(item)) : []),
+    ];
 
     if (doFilter) {
         entities = entitiesFilter.applyFilters(entities);
+    }
+
+    if (isBogusFolderOpen()) {
+        // Get tags of entities within the bogus folder
+        const filterData = structuredClone(entitiesFilter.getFilterData(FILTER_TYPES.TAG));
+        entities = entities.filter(x => x.type !== 'tag');
+        const otherTags = tags.filter(x => !filterData.selected.includes(x.id));
+        const bogusTags = [];
+        for (const entity of entities) {
+            for (const tag of otherTags) {
+                if (!bogusTags.includes(tag) && entitiesFilter.isElementTagged(entity, tag.id)) {
+                    bogusTags.push(tag);
+                }
+            }
+        }
+        entities.push(...bogusTags.map(item => tagToEntity(item)));
     }
 
     sortEntitiesList(entities);
@@ -1203,11 +1297,9 @@ async function replaceCurrentChat() {
     }
 }
 
-const TRUNCATION_THRESHOLD = 100;
-
 export function showMoreMessages() {
     let messageId = Number($('#chat').children('.mes').first().attr('mesid'));
-    let count = TRUNCATION_THRESHOLD;
+    let count = power_user.chat_truncation || Number.MAX_SAFE_INTEGER;
 
     console.debug('Inserting messages before', messageId, 'count', count, 'chat length', chat.length);
     const prevHeight = $('#chat').prop('scrollHeight');
@@ -1228,9 +1320,10 @@ export function showMoreMessages() {
 
 async function printMessages() {
     let startIndex = 0;
+    let count = power_user.chat_truncation || Number.MAX_SAFE_INTEGER;
 
-    if (chat.length > TRUNCATION_THRESHOLD) {
-        count_view_mes = chat.length - TRUNCATION_THRESHOLD;
+    if (chat.length > count) {
+        count_view_mes = chat.length - count;
         startIndex = count_view_mes;
         $('#chat').append('<div id="show_more_messages">Show more messages</div>');
     }
@@ -1239,11 +1332,36 @@ async function printMessages() {
         const item = chat[i];
         addOneMessage(item, { scroll: i === chat.length - 1 });
     }
+
+    // Scroll to bottom when all images are loaded
+    const images = document.querySelectorAll('#chat .mes img');
+    let imagesLoaded = 0;
+
+    for (let i = 0; i < images.length; i++) {
+        const image = images[i];
+        if (image instanceof HTMLImageElement) {
+            if (image.complete) {
+                incrementAndCheck();
+            } else {
+                image.addEventListener('load', incrementAndCheck);
+            }
+        }
+    }
+
+    function incrementAndCheck() {
+        imagesLoaded++;
+        if (imagesLoaded === images.length) {
+            scrollChatToBottom();
+        }
+    }
 }
 
 async function clearChat() {
     count_view_mes = 0;
     extension_prompts = {};
+    if (is_delete_mode) {
+        $("#dialogue_del_mes_cancel").trigger('click');
+    }
     $("#chat").children().remove();
     if ($('.zoomed_avatar[forChar]').length) {
         console.debug('saw avatars to remove')
@@ -1479,20 +1597,49 @@ export function updateMessageBlock(messageId, message) {
     const text = message?.extra?.display_text ?? message.mes;
     messageElement.find('.mes_text').html(messageFormatting(text, message.name, message.is_system, message.is_user));
     addCopyToCodeBlocks(messageElement)
-    appendImageToMessage(message, messageElement);
+    appendMediaToMessage(message, messageElement);
 }
 
-export function appendImageToMessage(mes, messageElement) {
+export function appendMediaToMessage(mes, messageElement) {
+    // Add image to message
     if (mes.extra?.image) {
+        const chatHeight = $('#chat').prop('scrollHeight');
         const image = messageElement.find('.mes_img');
         const text = messageElement.find('.mes_text');
         const isInline = !!mes.extra?.inline_image;
+        image.on('load', function () {
+            const scrollPosition = $('#chat').scrollTop();
+            const newChatHeight = $('#chat').prop('scrollHeight');
+            const diff = newChatHeight - chatHeight;
+            $('#chat').scrollTop(scrollPosition + diff);
+        });
         image.attr('src', mes.extra?.image);
         image.attr('title', mes.extra?.title || mes.title || '');
         messageElement.find(".mes_img_container").addClass("img_extra");
         image.toggleClass("img_inline", isInline);
         text.toggleClass('displayNone', !isInline);
     }
+
+    // Add file to message
+    if (mes.extra?.file) {
+        messageElement.find(".mes_file_container").remove();
+        const messageId = messageElement.attr('mesid');
+        const template = $('#message_file_template .mes_file_container').clone();
+        template.find('.mes_file_name').text(mes.extra.file.name);
+        template.find('.mes_file_size').text(humanFileSize(mes.extra.file.size));
+        template.find('.mes_file_download').attr('mesid', messageId);
+        template.find('.mes_file_delete').attr('mesid', messageId);
+        messageElement.find(".mes_block").append(template);
+    } else {
+        messageElement.find(".mes_file_container").remove();
+    }
+}
+
+/**
+ * @deprecated Use appendMediaToMessage instead.
+ */
+export function appendImageToMessage(mes, messageElement) {
+    appendMediaToMessage(mes, messageElement);
 }
 
 export function addCopyToCodeBlocks(messageElement) {
@@ -1684,7 +1831,7 @@ function addOneMessage(mes, { type = "normal", insertAfter = null, scroll = true
         const swipeMessage = $("#chat").find(`[mesid="${count_view_mes - 1}"]`);
         swipeMessage.find('.mes_text').html('');
         swipeMessage.find('.mes_text').append(messageText);
-        appendImageToMessage(mes, swipeMessage);
+        appendMediaToMessage(mes, swipeMessage);
         swipeMessage.attr('title', title);
         swipeMessage.find('.timestamp').text(timestamp).attr('title', `${params.extra.api} - ${params.extra.model}`);
         if (power_user.timestamp_model_icon && params.extra?.api) {
@@ -1701,12 +1848,12 @@ function addOneMessage(mes, { type = "normal", insertAfter = null, scroll = true
         }
     } else if (typeof forceId == 'number') {
         $("#chat").find(`[mesid="${forceId}"]`).find('.mes_text').append(messageText);
-        appendImageToMessage(mes, newMessage);
+        appendMediaToMessage(mes, newMessage);
         hideSwipeButtons();
         showSwipeButtons();
     } else {
         $("#chat").find(`[mesid="${count_view_mes}"]`).find('.mes_text').append(messageText);
-        appendImageToMessage(mes, newMessage);
+        appendMediaToMessage(mes, newMessage);
         hideSwipeButtons();
         count_view_mes++;
     }
@@ -1724,8 +1871,33 @@ function addOneMessage(mes, { type = "normal", insertAfter = null, scroll = true
     }
 }
 
-function getUserAvatar(avatarImg) {
+/**
+ * Returns the URL of the avatar for the given user avatar Id.
+ * @param {string} avatarImg User avatar Id
+ * @returns {string} User avatar URL
+ */
+export function getUserAvatar(avatarImg) {
     return `User Avatars/${avatarImg}`;
+}
+
+/**
+ * Returns the URL of the avatar for the given character Id.
+ * @param {number} characterId Character Id
+ * @returns {string} Avatar URL
+ */
+export function getCharacterAvatar(characterId) {
+    const character = characters[characterId];
+    const avatarImg = character?.avatar;
+
+    if (!avatarImg || avatarImg === 'none') {
+        return default_avatar;
+    }
+
+    return formatCharacterAvatar(avatarImg);
+}
+
+export function formatCharacterAvatar(characterAvatar) {
+    return `characters/${characterAvatar}`;
 }
 
 /**
@@ -1755,6 +1927,10 @@ function formatGenerationTimer(gen_started, gen_finished, tokenCount) {
         `Time to generate: ${seconds} seconds`,
         tokenCount > 0 ? `Token rate: ${Number(tokenCount / seconds).toFixed(1)} t/s` : '',
     ].join('\n');
+
+    if (isNaN(seconds)) {
+        return { timerValue: '', timerTitle };
+    }
 
     return { timerValue, timerTitle };
 }
@@ -1791,6 +1967,20 @@ function getLastMessageId() {
 }
 
 /**
+ * Returns the last message in the chat.
+ * @returns {string} The last message in the chat.
+ */
+function getLastMessage() {
+    const index = chat?.length - 1;
+
+    if (!isNaN(index) && index >= 0) {
+        return chat[index].mes;
+    }
+
+    return '';
+}
+
+/**
  * Substitutes {{macro}} parameters in a string.
  * @param {string} content - The string to substitute parameters in.
  * @param {*} _name1 - The name of the user. Uses global name1 if not provided.
@@ -1819,6 +2009,8 @@ function substituteParams(content, _name1, _name2, _original, _group, _replaceCh
 
     if (_replaceCharacterCard) {
         const fields = getCharacterCardFields();
+        content = content.replace(/{{charPrompt}}/gi, fields.system || '');
+        content = content.replace(/{{charJailbreak}}/gi, fields.jailbreak || '');
         content = content.replace(/{{description}}/gi, fields.description || '');
         content = content.replace(/{{personality}}/gi, fields.personality || '');
         content = content.replace(/{{scenario}}/gi, fields.scenario || '');
@@ -1830,6 +2022,7 @@ function substituteParams(content, _name1, _name2, _original, _group, _replaceCh
     content = content.replace(/{{char}}/gi, _name2);
     content = content.replace(/{{charIfNotGroup}}/gi, _group);
     content = content.replace(/{{group}}/gi, _group);
+    content = content.replace(/{{lastMessage}}/gi, getLastMessage());
     content = content.replace(/{{lastMessageId}}/gi, getLastMessageId());
 
     content = content.replace(/<USER>/gi, _name1);
@@ -1999,16 +2192,17 @@ function getStoppingStrings(isImpersonate) {
  * @param {string} quiet_prompt Instruction prompt for the AI
  * @param {boolean} quietToLoud Whether the message should be sent in a foreground (loud) or background (quiet) mode
  * @param {boolean} skipWIAN whether to skip addition of World Info and Author's Note into the prompt
+ * @param {string} quietImage Image to use for the quiet prompt
  * @returns
  */
-export async function generateQuietPrompt(quiet_prompt, quietToLoud, skipWIAN) {
+export async function generateQuietPrompt(quiet_prompt, quietToLoud, skipWIAN, quietImage = null) {
     console.log('got into genQuietPrompt')
     const skipWIANvalue = skipWIAN
     return await new Promise(
         async function promptPromise(resolve, reject) {
             if (quietToLoud === true) {
                 try {
-                    await Generate('quiet', { resolve, reject, quiet_prompt, quietToLoud: true, skipWIAN: skipWIAN, force_name2: true, });
+                    await Generate('quiet', { resolve, reject, quiet_prompt, quietToLoud: true, skipWIAN: skipWIAN, force_name2: true, quietImage: quietImage });
                 }
                 catch {
                     reject();
@@ -2017,7 +2211,7 @@ export async function generateQuietPrompt(quiet_prompt, quietToLoud, skipWIAN) {
             else {
                 try {
                     console.log('going to generate non-QuietToLoud')
-                    await Generate('quiet', { resolve, reject, quiet_prompt, quietToLoud: false, skipWIAN: skipWIAN, force_name2: true, });
+                    await Generate('quiet', { resolve, reject, quiet_prompt, quietToLoud: false, skipWIAN: skipWIAN, force_name2: true, quietImage: quietImage });
                 }
                 catch {
                     reject();
@@ -2566,7 +2760,7 @@ export async function generateRaw(prompt, api) {
     return message;
 }
 
-async function Generate(type, { automatic_trigger, force_name2, resolve, reject, quiet_prompt, quietToLoud, skipWIAN, force_chid, signal } = {}, dryRun = false) {
+async function Generate(type, { automatic_trigger, force_name2, resolve, reject, quiet_prompt, quietToLoud, skipWIAN, force_chid, signal, quietImage } = {}, dryRun = false) {
     console.log('Generate entered');
     setGenerationProgress(0);
     generation_started = new Date();
@@ -2621,7 +2815,7 @@ async function Generate(type, { automatic_trigger, force_name2, resolve, reject,
     }
 
     if (selected_group && !is_group_generating && !dryRun) {
-        generateGroupWrapper(false, type, { resolve, reject, quiet_prompt, force_chid, signal: abortController.signal });
+        generateGroupWrapper(false, type, { resolve, reject, quiet_prompt, force_chid, signal: abortController.signal, quietImage });
         return;
     } else if (selected_group && !is_group_generating && dryRun) {
         const characterIndexMap = new Map(characters.map((char, index) => [char.avatar, index]));
@@ -2706,7 +2900,7 @@ async function Generate(type, { automatic_trigger, force_name2, resolve, reject,
         //*********************************
 
         //for normal messages sent from user..
-        if (textareaText != "" && !automatic_trigger && type !== 'quiet') {
+        if ((textareaText != "" || hasPendingFileAttachment()) && !automatic_trigger && type !== 'quiet') {
             // If user message contains no text other than bias - send as a system message
             if (messageBias && replaceBiasMarkup(textareaText).trim().length === 0) {
                 sendSystemMessage(system_message_types.GENERIC, ' ', { bias: messageBias });
@@ -2778,12 +2972,22 @@ async function Generate(type, { automatic_trigger, force_name2, resolve, reject,
             coreChat.pop();
         }
 
-        coreChat = coreChat.map(x => ({
-            ...x,
-            mes: getRegexedString(x.mes, x.is_user ? regex_placement.USER_INPUT : regex_placement.AI_OUTPUT, {
-                isPrompt: true,
-            }),
-        }))
+        coreChat = coreChat.map(chatItem => {
+            let message = chatItem.mes;
+            let regexType = chatItem.is_user ? regex_placement.USER_INPUT : regex_placement.AI_OUTPUT;
+            let options = { isPrompt: true };
+
+            let regexedMessage = getRegexedString(message, regexType, options);
+
+            if (chatItem.extra?.file?.text) {
+                regexedMessage += `\n\n${chatItem.extra.file.text}`;
+            }
+
+            return {
+                ...chatItem,
+                mes: regexedMessage,
+            };
+        });
 
         // Determine token limit
         let this_max_context = getMaxContextSize();
@@ -2984,7 +3188,7 @@ async function Generate(type, { automatic_trigger, force_name2, resolve, reject,
         console.debug('calling runGenerate');
 
         if (!dryRun) {
-            streamingProcessor = isStreamingEnabled() ? new StreamingProcessor(type, force_name2, generation_started) : false;
+            streamingProcessor = isStreamingEnabled() && type !== 'quiet' ? new StreamingProcessor(type, force_name2, generation_started) : false;
         }
 
         if (isContinue) {
@@ -3094,12 +3298,14 @@ async function Generate(type, { automatic_trigger, force_name2, resolve, reject,
                 }
 
                 // Add character's name
-                // Force name append on continue
+                // Force name append on continue (if not continuing on user message)
                 if (!isInstruct && force_name2) {
                     if (!lastMesString.endsWith('\n')) {
                         lastMesString += '\n';
                     }
-                    lastMesString += `${name2}:`;
+                    if (!isContinue || !(chat[chat.length - 1]?.is_user)) {
+                        lastMesString += `${name2}:`;
+                    }
                 }
 
                 return lastMesString;
@@ -3316,7 +3522,7 @@ async function Generate(type, { automatic_trigger, force_name2, resolve, reject,
                 generate_data = getNovelGenerationData(finalPrompt, presetSettings, maxLength, isImpersonate, cfgValues);
             }
             else if (main_api == 'openai') {
-                let [prompt, counts] = prepareOpenAIMessages({
+                let [prompt, counts] = await prepareOpenAIMessages({
                     name2: name2,
                     charDescription: description,
                     charPersonality: personality,
@@ -3327,6 +3533,7 @@ async function Generate(type, { automatic_trigger, force_name2, resolve, reject,
                     bias: promptBias,
                     type: type,
                     quietPrompt: quiet_prompt,
+                    quietImage: quietImage,
                     cyclePrompt: cyclePrompt,
                     systemPromptOverride: system,
                     jailbreakPromptOverride: jailbreak,
@@ -3564,6 +3771,7 @@ async function Generate(type, { automatic_trigger, force_name2, resolve, reject,
                 activateSendButtons();
                 showSwipeButtons();
                 setGenerationProgress(0);
+                streamingProcessor = null;
 
                 if (type !== 'quiet') {
                     triggerAutoContinue(messageChunk, isImpersonate);
@@ -3577,12 +3785,9 @@ async function Generate(type, { automatic_trigger, force_name2, resolve, reject,
                 }
 
                 reject(exception);
-                $("#send_textarea").removeAttr('disabled');
-                is_send_press = false;
-                activateSendButtons();
-                showSwipeButtons();
-                setGenerationProgress(0);
+                unblockGeneration();
                 console.log(exception);
+                streamingProcessor = null;
             };
 
         } //rungenerate ends
@@ -3753,6 +3958,7 @@ export async function sendMessageAsUser(textareaText, messageBias) {
         console.debug('checking bias');
         chat[chat.length - 1]['extra']['bias'] = messageBias;
     }
+    await populateFileAttachment(chat[chat.length - 1]);
     statMesProcess(chat[chat.length - 1], 'user', characters, this_chid, '');
     // Wait for all handlers to finish before continuing with the prompt
     const chat_id = (chat.length - 1);
@@ -4597,7 +4803,7 @@ async function renamePastChats(newAvatar, newValue) {
     }
 }
 
-function saveChatDebounced() {
+export function saveChatDebounced() {
     const chid = this_chid;
     const selectedGroup = selected_group;
 
@@ -4692,21 +4898,20 @@ async function read_avatar_load(input) {
             create_save.avatar = input.files;
         }
 
-        const e = await new Promise((resolve, reject) => {
-            const reader = new FileReader();
-            reader.onload = resolve;
-            reader.onerror = reject;
-            reader.readAsDataURL(input.files[0]);
-        })
+        const file = input.files[0];
+        const fileData = await getBase64Async(file);
 
-        $('#dialogue_popup').addClass('large_dialogue_popup wide_dialogue_popup');
+        if (!power_user.never_resize_avatars) {
+            $('#dialogue_popup').addClass('large_dialogue_popup wide_dialogue_popup');
+            const croppedImage = await callPopup(getCropPopup(fileData), 'avatarToCrop');
+            if (!croppedImage) {
+                return;
+            }
 
-        const croppedImage = await callPopup(getCropPopup(e.target.result), 'avatarToCrop');
-        if (!croppedImage) {
-            return;
+            $("#avatar_load_preview").attr("src", croppedImage);
+        } else {
+            $("#avatar_load_preview").attr("src", fileData);
         }
-
-        $("#avatar_load_preview").attr("src", croppedImage || e.target.result);
 
         if (menu_type == "create") {
             return;
@@ -4996,11 +5201,10 @@ export async function getUserAvatars() {
         $("#user_avatar_block").append('<div class="avatar_upload">+</div>');
 
         for (var i = 0; i < getData.length; i++) {
-            //console.log(1);
             appendUserAvatar(getData[i]);
         }
-        //var aa = JSON.parse(getData[0]);
-        //const load_ch_coint = Object.getOwnPropertyNames(getData);
+
+        return getData;
     }
 }
 
@@ -5069,24 +5273,19 @@ async function uploadUserAvatar(e) {
     }
 
     const formData = new FormData($("#form_upload_avatar").get(0));
-
-    const dataUrl = await new Promise((resolve, reject) => {
-        const reader = new FileReader();
-        reader.onload = resolve;
-        reader.onerror = reject;
-        reader.readAsDataURL(file);
-    });
-
-    $('#dialogue_popup').addClass('large_dialogue_popup wide_dialogue_popup');
-    const confirmation = await callPopup(getCropPopup(dataUrl.target.result), 'avatarToCrop');
-    if (!confirmation) {
-        return;
-    }
-
+    const dataUrl = await getBase64Async(file);
     let url = "/uploaduseravatar";
 
-    if (crop_data !== undefined) {
-        url += `?crop=${encodeURIComponent(JSON.stringify(crop_data))}`;
+    if (!power_user.never_resize_avatars) {
+        $('#dialogue_popup').addClass('large_dialogue_popup wide_dialogue_popup');
+        const confirmation = await callPopup(getCropPopup(dataUrl), 'avatarToCrop');
+        if (!confirmation) {
+            return;
+        }
+
+        if (crop_data !== undefined) {
+            url += `?crop=${encodeURIComponent(JSON.stringify(crop_data))}`;
+        }
     }
 
     jQuery.ajax({
@@ -5097,12 +5296,18 @@ async function uploadUserAvatar(e) {
         cache: false,
         contentType: false,
         processData: false,
-        success: async function () {
+        success: async function (data) {
             // If the user uploaded a new avatar, we want to make sure it's not cached
             const name = formData.get("overwrite_name");
             if (name) {
                 await fetch(getUserAvatar(name), { cache: "no-cache" });
                 reloadUserAvatar(true);
+            }
+
+            if (!name && data.path) {
+                await getUserAvatars();
+                await delay(500);
+                await createPersona(data.path);
             }
 
             crop_data = undefined;
@@ -5142,7 +5347,7 @@ async function doOnboarding(avatarId) {
 
 //***************SETTINGS****************//
 ///////////////////////////////////////////
-async function getSettings(type) {
+async function getSettings() {
     const response = await fetch("/getsettings", {
         method: "POST",
         headers: getRequestHeaders(),
@@ -5305,6 +5510,8 @@ async function getSettings(type) {
         api_server_textgenerationwebui = settings.api_server_textgenerationwebui;
         $("#textgenerationwebui_api_url_text").val(api_server_textgenerationwebui);
         $("#aphrodite_api_url_text").val(api_server_textgenerationwebui);
+        $("#tabby_api_url_text").val(api_server_textgenerationwebui);
+        $('#koboldcpp_api_url_text').val(api_server_textgenerationwebui);
 
         selected_button = settings.selected_button;
 
@@ -5315,6 +5522,7 @@ async function getSettings(type) {
         }
     }
 
+    settingsReady = true;
     eventSource.emit(event_types.SETTINGS_LOADED);
 }
 
@@ -5457,6 +5665,7 @@ function openMessageDelete(fromSlashCommand) {
             selected_group: ${selected_group}
             is_group_generating: ${is_group_generating}`);
     }
+    this_del_mes = -1;
     is_delete_mode = true;
 }
 
@@ -5492,7 +5701,7 @@ async function messageEditDone(div) {
     );
     mesBlock.find(".mes_bias").empty();
     mesBlock.find(".mes_bias").append(messageFormatting(bias));
-    appendImageToMessage(mes, div.closest(".mes"));
+    appendMediaToMessage(mes, div.closest(".mes"));
     addCopyToCodeBlocks(div.closest(".mes"));
     await eventSource.emit(event_types.MESSAGE_EDITED, this_edit_mes_id);
 
@@ -6023,13 +6232,9 @@ function callPopup(text, type, inputValue = '', { okButton, rows, wide, large } 
         popup_type = type;
     }
 
-    if (wide) {
-        $("#dialogue_popup").addClass("wide_dialogue_popup");
-    }
+    $('#dialogue_popup').toggleClass('wide_dialogue_popup', !!wide);
 
-    if (large) {
-        $("#dialogue_popup").addClass("large_dialogue_popup");
-    }
+    $('#dialogue_popup').toggleClass('large_dialogue_popup', !!large);
 
     $("#dialogue_popup_cancel").css("display", "inline-block");
     switch (popup_type) {
@@ -6325,6 +6530,8 @@ function enlargeMessageImage() {
     imgContainer.prepend(img);
     imgContainer.addClass('img_enlarged_container');
     imgContainer.find('code').addClass('txt').text(title);
+    const titleEmpty = !title || title.trim().length === 0;
+    imgContainer.find('pre').toggle(!titleEmpty);
     addCopyToCodeBlocks(imgContainer);
     callPopup(imgContainer, 'text', '', { wide: true, large: true });
 }
@@ -6697,6 +6904,7 @@ window["SillyTavern"].getContext = function () {
         deactivateSendButtons,
         saveReply,
         registerSlashCommand: registerSlashCommand,
+        executeSlashCommands: executeSlashCommands,
         registerHelper: registerExtensionHelper,
         registedDebugFunction: registerDebugFunction,
         renderExtensionTemplate: renderExtensionTemplate,
@@ -6705,6 +6913,9 @@ window["SillyTavern"].getContext = function () {
         extensionSettings: extension_settings,
         ModuleWorkerWrapper: ModuleWorkerWrapper,
         getTokenizerModel: getTokenizerModel,
+        generateQuietPrompt: generateQuietPrompt,
+        tags: tags,
+        tagMap: tag_map,
     };
 };
 
@@ -7036,19 +7247,6 @@ const swipe_right = () => {
             }
         });
     }
-}
-
-
-
-function displayOverrideWarnings() {
-    if (!this_chid || !selected_group) {
-        $('.prompt_overridden').hide();
-        $('.jailbreak_overridden').hide();
-        return;
-    }
-
-    $('.prompt_overridden').toggle(!!(characters[this_chid]?.data?.system_prompt));
-    $('.jailbreak_overridden').toggle(!!(characters[this_chid]?.data?.post_history_instructions));
 }
 
 function connectAPISlash(_, text) {
@@ -7480,6 +7678,29 @@ jQuery(async function () {
         await selectCharacterById(id);
     });
 
+    $(document).on("click", ".bogus_folder_select", function () {
+        const tagId = $(this).attr('tagid');
+        console.log('Bogus folder clicked', tagId);
+
+        const filterData = structuredClone(entitiesFilter.getFilterData(FILTER_TYPES.TAG));
+
+        if (!Array.isArray(filterData.selected)) {
+            filterData.selected = [];
+            filterData.excluded = [];
+            filterData.bogus = false;
+        }
+
+        if (tagId === 'back') {
+            filterData.selected.pop();
+            filterData.bogus = filterData.selected.length > 0;
+        } else {
+            filterData.selected.push(tagId);
+            filterData.bogus = true;
+        }
+
+        entitiesFilter.setFilterData(FILTER_TYPES.TAG, filterData);
+    });
+
     $(document).on("input", ".edit_textarea", function () {
         scroll_holder = $("#chat").scrollTop();
         $(this).height(0).height(this.scrollHeight);
@@ -7886,6 +8107,11 @@ jQuery(async function () {
             await writeSecret(SECRET_KEYS.APHRODITE, aphroditeKey);
         }
 
+        const tabbyKey = String($("#api_key_tabby").val()).trim();
+        if (tabbyKey.length) {
+            await writeSecret(SECRET_KEYS.TABBY, tabbyKey)
+        }
+
         const urlSourceId = getTextGenUrlSourceId();
 
         if (urlSourceId && $(urlSourceId).val() !== "") {
@@ -7910,12 +8136,14 @@ jQuery(async function () {
 
     function showMenu() {
         showBookmarksButtons();
-        menu.stop().fadeIn(250);
+        // menu.stop()
+        menu.fadeIn(animation_duration);
         optionsPopper.update();
     }
 
     function hideMenu() {
-        menu.stop().fadeOut(250);
+        // menu.stop();
+        menu.fadeOut(animation_duration);
         optionsPopper.update();
     }
 
@@ -7923,14 +8151,20 @@ jQuery(async function () {
         return menu.is(':hover') || button.is(':hover');
     }
 
-    button.on('mouseenter click', function () { showMenu(); });
-    button.on('mouseleave', function () {
+    button.on('click', function () {
+        if (menu.is(':visible')) {
+            hideMenu();
+        } else {
+            showMenu();
+        }
+    });
+    button.on('blur', function () {
         //delay to prevent menu hiding when mouse leaves button into menu
         setTimeout(() => {
             if (!isMouseOverButtonOrMenu()) { hideMenu(); }
         }, 100)
     });
-    menu.on('mouseleave', function () {
+    menu.on('blur', function () {
         //delay to prevent menu hide when mouseleaves menu into button
         setTimeout(() => {
             if (!isMouseOverButtonOrMenu()) { hideMenu(); }
@@ -8065,9 +8299,8 @@ jQuery(async function () {
             $(this).parent().css("background", css_mes_bg);
             $(this).prop("checked", false);
         });
-        this_del_mes = 0;
-        console.debug('canceled del msgs, calling showswipesbtns');
         showSwipeButtons();
+        this_del_mes = -1;
         is_delete_mode = false;
     });
 
@@ -8081,21 +8314,26 @@ jQuery(async function () {
             $(this).parent().css("background", css_mes_bg);
             $(this).prop("checked", false);
         });
-        $(".mes[mesid='" + this_del_mes + "']")
-            .nextAll("div")
-            .remove();
-        $(".mes[mesid='" + this_del_mes + "']").remove();
-        chat.length = this_del_mes;
-        count_view_mes = this_del_mes;
-        await saveChatConditional();
-        var $textchat = $("#chat");
-        $textchat.scrollTop($textchat[0].scrollHeight);
-        eventSource.emit(event_types.MESSAGE_DELETED, chat.length);
-        this_del_mes = 0;
-        $('#chat .mes').last().addClass('last_mes');
-        $('#chat .mes').eq(-2).removeClass('last_mes');
-        console.debug('confirmed del msgs, calling showswipesbtns');
+
+        if (this_del_mes >= 0) {
+            $(".mes[mesid='" + this_del_mes + "']")
+                .nextAll("div")
+                .remove();
+            $(".mes[mesid='" + this_del_mes + "']").remove();
+            chat.length = this_del_mes;
+            count_view_mes = this_del_mes;
+            await saveChatConditional();
+            var $textchat = $("#chat");
+            $textchat.scrollTop($textchat[0].scrollHeight);
+            eventSource.emit(event_types.MESSAGE_DELETED, chat.length);
+            $('#chat .mes').last().addClass('last_mes');
+            $('#chat .mes').eq(-2).removeClass('last_mes');
+        } else {
+            console.log('this_del_mes is not >= 0, not deleting');
+        }
+
         showSwipeButtons();
+        this_del_mes = -1;
         is_delete_mode = false;
     });
 
@@ -8404,7 +8642,7 @@ jQuery(async function () {
                 chat[this_edit_mes_id].is_system,
                 chat[this_edit_mes_id].is_user,
             ));
-        appendImageToMessage(chat[this_edit_mes_id], $(this).closest(".mes"));
+        appendMediaToMessage(chat[this_edit_mes_id], $(this).closest(".mes"));
         addCopyToCodeBlocks($(this).closest(".mes"));
         this_edit_mes_id = undefined;
     });
@@ -8578,7 +8816,7 @@ jQuery(async function () {
 
         startStatusLoading();
         // Check near immediately rather than waiting for up to 90s
-        setTimeout(getStatusNovel, 10);
+        await getStatusNovel();
     });
 
     //**************************CHARACTER IMPORT EXPORT*************************//
@@ -8852,19 +9090,12 @@ jQuery(async function () {
     });
 
     $(document).on('click', '.mes .avatar', function () {
-
-        //console.log(isMobile());
-        //console.log($('body').hasClass('waifuMode'));
-
-        /* if (isMobile() === true && !$('body').hasClass('waifuMode')) {
-            console.debug('saw mobile regular mode, returning');
-            return;
-        } else { console.debug('saw valid env for zoomed display') } */
-
-        let thumbURL = $(this).children('img').attr('src');
-        let charsPath = '/characters/'
-        let targetAvatarImg = thumbURL.substring(thumbURL.lastIndexOf("=") + 1);
-        let charname = targetAvatarImg.replace('.png', '');
+        const messageElement = $(this).closest('.mes');
+        const thumbURL = $(this).children('img').attr('src');
+        const charsPath = '/characters/'
+        const targetAvatarImg = thumbURL.substring(thumbURL.lastIndexOf("=") + 1);
+        const charname = targetAvatarImg.replace('.png', '');
+        const isValidCharacter = characters.some(x => x.avatar === decodeURIComponent(targetAvatarImg));
 
         // Remove existing zoomed avatars for characters that are not the clicked character when moving UI is not enabled
         if (!power_user.movingUI) {
@@ -8877,7 +9108,7 @@ jQuery(async function () {
             });
         }
 
-        let avatarSrc = isDataURL(thumbURL) ? thumbURL : charsPath + targetAvatarImg;
+        const avatarSrc = isDataURL(thumbURL) ? thumbURL : charsPath + targetAvatarImg;
         if ($(`.zoomed_avatar[forChar="${charname}"]`).length) {
             console.debug('removing container as it already existed')
             $(`.zoomed_avatar[forChar="${charname}"]`).remove();
@@ -8891,11 +9122,11 @@ jQuery(async function () {
             newElement.find('.drag-grabber').attr('id', `zoomFor_${charname}header`);
 
             $('body').append(newElement);
-            if ($(this).parent().parent().attr('is_user') == 'true') { //handle user avatars
+            if (messageElement.attr('is_user') == 'true') { //handle user avatars
                 $(`.zoomed_avatar[forChar="${charname}"] img`).attr('src', thumbURL);
-            } else if ($(this).parent().parent().attr('is_system') == 'true') { //handle system avatars
+            } else if (messageElement.attr('is_system') == 'true' && !isValidCharacter) { //handle system avatars
                 $(`.zoomed_avatar[forChar="${charname}"] img`).attr('src', thumbURL);
-            } else if ($(this).parent().parent().attr('is_user') == 'false') { //handle char avatars
+            } else if (messageElement.attr('is_user') == 'false') { //handle char avatars
                 $(`.zoomed_avatar[forChar="${charname}"] img`).attr('src', avatarSrc);
             }
             loadMovingUIState();
@@ -8988,8 +9219,11 @@ jQuery(async function () {
         }
     });
 
+    let manualInputTimeout;
+
     $(document).on('input', '.range-block-counter input, .neo-range-input', function () {
-        setTimeout(() => {
+        clearTimeout(manualInputTimeout);
+        manualInputTimeout = setTimeout(() => {
             const caretPosition = saveCaretPosition($(this).get(0));
             const myText = $(this).val().trim();
             $(this).val(myText); // trim line breaks and spaces
@@ -9008,6 +9242,13 @@ jQuery(async function () {
             const rawStepCompare = myValue / masterStep
             const closestStep = Math.round(rawStepCompare)
             const closestStepRaw = (closestStep) * masterStep
+
+            //yolo anything for Lab Mode
+            if (power_user.enableLabMode) {
+                //console.log($(masterElement).attr('id'), myValue)
+                $(masterElement).val(myValue).trigger('input')
+                return
+            }
 
             //if text box val is not a number, reset slider val to its previous and wait for better input
             if (Number.isNaN(myValue)) {
@@ -9048,7 +9289,7 @@ jQuery(async function () {
 
             restoreCaretPosition($(this).get(0), caretPosition);
         }, 2000);
-    })
+    });
 
     $(".user_stats_button").on('click', function () {
         userStatsHandler();
