@@ -1,4 +1,4 @@
-FROM node:19.1.0-alpine3.16
+FROM node:lts-alpine3.19
 
 # Arguments
 ARG APP_HOME=/home/node/app
@@ -6,36 +6,26 @@ ARG APP_HOME=/home/node/app
 # Install system dependencies
 RUN apk add gcompat tini git
 
-# Ensure proper handling of kernel signals
-ENTRYPOINT [ "tini", "--" ]
-
 # Create app directory
 WORKDIR ${APP_HOME}
+
+# Set NODE_ENV to production
+ENV NODE_ENV=production
 
 # Install app dependencies
 COPY package*.json post-install.js ./
 RUN \
   echo "*** Install npm packages ***" && \
-  npm install && npm cache clean --force
+  npm i --no-audit --no-fund --loglevel=error --no-progress --omit=dev && npm cache clean --force
 
 # Bundle app source
 COPY . ./
 
 # Copy default chats, characters and user avatars to <folder>.default folder
 RUN \
-  IFS="," RESOURCES="assets,backgrounds,user,context,instruct,QuickReplies,movingUI,themes,characters,chats,groups,group chats,User Avatars,worlds,OpenAI Settings,NovelAI Settings,KoboldAI Settings,TextGen Settings" && \
-  \
-  echo "*** Store default $RESOURCES in <folder>.default ***" && \
-  for R in $RESOURCES; do mv "public/$R" "public/$R.default"; done || true && \
-  \
-  echo "*** Create symbolic links to config directory ***" && \
-  for R in $RESOURCES; do ln -s "../config/$R" "public/$R"; done || true && \
-  \
-  rm -f "config.yaml" "public/settings.json" || true && \
+  rm -f "config.yaml" || true && \
   ln -s "./config/config.yaml" "config.yaml" || true && \
-  ln -s "../config/settings.json" "public/settings.json" || true && \
-  mkdir "config" || true && \
-  mkdir -p "public/user" || true
+  mkdir "config" || true
 
 # Cleanup unnecessary files
 RUN \
@@ -49,4 +39,5 @@ RUN \
 
 EXPOSE 8000
 
-CMD [ "./docker-entrypoint.sh" ]
+# Ensure proper handling of kernel signals
+ENTRYPOINT ["tini", "--", "./docker-entrypoint.sh"]

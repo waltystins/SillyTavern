@@ -1,8 +1,10 @@
+import { DOMPurify } from '../lib.js';
 import { callPopup, getRequestHeaders } from '../script.js';
 
 export const SECRET_KEYS = {
     HORDE: 'api_key_horde',
     MANCER: 'api_key_mancer',
+    VLLM: 'api_key_vllm',
     APHRODITE: 'api_key_aphrodite',
     TABBY: 'api_key_tabby',
     OPENAI: 'api_key_openai',
@@ -17,8 +19,26 @@ export const SECRET_KEYS = {
     MISTRALAI: 'api_key_mistralai',
     TOGETHERAI: 'api_key_togetherai',
     INFERMATICAI: 'api_key_infermaticai',
+    DREAMGEN: 'api_key_dreamgen',
     CUSTOM: 'api_key_custom',
     OOBA: 'api_key_ooba',
+    NOMICAI: 'api_key_nomicai',
+    KOBOLDCPP: 'api_key_koboldcpp',
+    LLAMACPP: 'api_key_llamacpp',
+    COHERE: 'api_key_cohere',
+    PERPLEXITY: 'api_key_perplexity',
+    GROQ: 'api_key_groq',
+    AZURE_TTS: 'api_key_azure_tts',
+    FEATHERLESS: 'api_key_featherless',
+    ZEROONEAI: 'api_key_01ai',
+    HUGGINGFACE: 'api_key_huggingface',
+    STABILITY: 'api_key_stability',
+    BLOCKENTROPY: 'api_key_blockentropy',
+    CUSTOM_OPENAI_TTS: 'api_key_custom_openai_tts',
+    NANOGPT: 'api_key_nanogpt',
+    TAVILY: 'api_key_tavily',
+    BFL: 'api_key_bfl',
+    GENERIC: 'api_key_generic',
 };
 
 const INPUT_MAP = {
@@ -32,6 +52,7 @@ const INPUT_MAP = {
     [SECRET_KEYS.AI21]: '#api_key_ai21',
     [SECRET_KEYS.SCALE_COOKIE]: '#scale_cookie',
     [SECRET_KEYS.MAKERSUITE]: '#api_key_makersuite',
+    [SECRET_KEYS.VLLM]: '#api_key_vllm',
     [SECRET_KEYS.APHRODITE]: '#api_key_aphrodite',
     [SECRET_KEYS.TABBY]: '#api_key_tabby',
     [SECRET_KEYS.MISTRALAI]: '#api_key_mistralai',
@@ -39,6 +60,19 @@ const INPUT_MAP = {
     [SECRET_KEYS.TOGETHERAI]: '#api_key_togetherai',
     [SECRET_KEYS.OOBA]: '#api_key_ooba',
     [SECRET_KEYS.INFERMATICAI]: '#api_key_infermaticai',
+    [SECRET_KEYS.DREAMGEN]: '#api_key_dreamgen',
+    [SECRET_KEYS.NOMICAI]: '#api_key_nomicai',
+    [SECRET_KEYS.KOBOLDCPP]: '#api_key_koboldcpp',
+    [SECRET_KEYS.LLAMACPP]: '#api_key_llamacpp',
+    [SECRET_KEYS.COHERE]: '#api_key_cohere',
+    [SECRET_KEYS.PERPLEXITY]: '#api_key_perplexity',
+    [SECRET_KEYS.GROQ]: '#api_key_groq',
+    [SECRET_KEYS.FEATHERLESS]: '#api_key_featherless',
+    [SECRET_KEYS.ZEROONEAI]: '#api_key_01ai',
+    [SECRET_KEYS.HUGGINGFACE]: '#api_key_huggingface',
+    [SECRET_KEYS.BLOCKENTROPY]: '#api_key_blockentropy',
+    [SECRET_KEYS.NANOGPT]: '#api_key_nanogpt',
+    [SECRET_KEYS.GENERIC]: '#api_key_generic',
 };
 
 async function clearSecret() {
@@ -46,14 +80,15 @@ async function clearSecret() {
     await writeSecret(key, '');
     secret_state[key] = false;
     updateSecretDisplay();
-    $(INPUT_MAP[key]).val('');
+    $(INPUT_MAP[key]).val('').trigger('input');
     $('#main_api').trigger('change');
 }
 
-function updateSecretDisplay() {
+export function updateSecretDisplay() {
     for (const [secret_key, input_selector] of Object.entries(INPUT_MAP)) {
         const validSecret = !!secret_state[secret_key];
-        const placeholder = validSecret ? '✔️ Key saved' : '❌ Missing key';
+
+        const placeholder = $('#viewSecrets').attr(validSecret ? 'key_saved_text' : 'missing_key_text');
         $(input_selector).attr('placeholder', placeholder);
     }
 }
@@ -100,7 +135,7 @@ export async function writeSecret(key, value) {
             const text = await response.text();
 
             if (text == 'ok') {
-                secret_state[key] = true;
+                secret_state[key] = !!value;
                 updateSecretDisplay();
             }
         }

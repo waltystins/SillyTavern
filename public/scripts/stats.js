@@ -1,4 +1,5 @@
 // statsHelper.js
+import { moment } from '../lib.js';
 import { getRequestHeaders, callPopup, characters, this_chid } from '../script.js';
 import { humanizeGenTime } from './RossAscends-mods.js';
 import { registerDebugFunction } from './power-user.js';
@@ -266,7 +267,7 @@ function countWords(str) {
  * @param {string} oldMesssage - The old message that's being processed.
  */
 async function statMesProcess(line, type, characters, this_chid, oldMesssage) {
-    if (this_chid === undefined) {
+    if (this_chid === undefined || characters[this_chid] === undefined) {
         return;
     }
     await getStats();

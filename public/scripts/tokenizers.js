@@ -1,16 +1,16 @@
+import { localforage } from '../lib.js';
 import { characters, main_api, api_server, nai_settings, online_status, this_chid } from '../script.js';
 import { power_user, registerDebugFunction } from './power-user.js';
 import { chat_completion_sources, model_list, oai_settings } from './openai.js';
 import { groups, selected_group } from './group-chats.js';
 import { getStringHash } from './utils.js';
 import { kai_flags } from './kai-settings.js';
-import { textgen_types, textgenerationwebui_settings as textgen_settings, getTextGenServer } from './textgen-settings.js';
-import { getCurrentOpenRouterModelTokenizer, openRouterModels } from './textgen-models.js';
-
-const { OOBA, TABBY, KOBOLDCPP, APHRODITE, LLAMACPP, OPENROUTER } = textgen_types;
+import { textgen_types, textgenerationwebui_settings as textgen_settings, getTextGenServer, getTextGenModel } from './textgen-settings.js';
+import { getCurrentDreamGenModelTokenizer, getCurrentOpenRouterModelTokenizer, openRouterModels } from './textgen-models.js';
 
 export const CHARACTERS_PER_TOKEN_RATIO = 3.35;
-const TOKENIZER_WARNING_KEY = 'tokenizationWarningShown';
+export const TOKENIZER_WARNING_KEY = 'tokenizationWarningShown';
+export const TOKENIZER_SUPPORTED_KEY = 'tokenizationSupported';
 
 export const tokenizers = {
     NONE: 0,
@@ -24,19 +24,38 @@ export const tokenizers = {
     YI: 8,
     API_TEXTGENERATIONWEBUI: 9,
     API_KOBOLD: 10,
+    CLAUDE: 11,
+    LLAMA3: 12,
+    GEMMA: 13,
+    JAMBA: 14,
+    QWEN2: 15,
+    COMMAND_R: 16,
+    NEMO: 17,
     BEST_MATCH: 99,
 };
 
-export const SENTENCEPIECE_TOKENIZERS = [
+// A list of local tokenizers that support encoding and decoding token ids.
+export const ENCODE_TOKENIZERS = [
     tokenizers.LLAMA,
     tokenizers.MISTRAL,
     tokenizers.YI,
+    tokenizers.LLAMA3,
+    tokenizers.GEMMA,
+    tokenizers.JAMBA,
+    tokenizers.QWEN2,
+    tokenizers.COMMAND_R,
+    tokenizers.NEMO,
     // uncomment when NovelAI releases Kayra and Clio weights, lol
     //tokenizers.NERD,
     //tokenizers.NERD2,
 ];
 
-export const TEXTGEN_TOKENIZERS = [OOBA, TABBY, KOBOLDCPP, LLAMACPP, APHRODITE];
+/**
+ * A list of Text Completion sources that support remote tokenization.
+ * Populated in initTokenziers due to circular dependencies.
+ * @type {string[]}
+ */
+export const TEXTGEN_TOKENIZERS = [];
 
 const TOKENIZER_URLS = {
     [tokenizers.GPT2]: {
@@ -78,13 +97,48 @@ const TOKENIZER_URLS = {
         decode: '/api/tokenizers/yi/decode',
         count: '/api/tokenizers/yi/encode',
     },
+    [tokenizers.CLAUDE]: {
+        encode: '/api/tokenizers/claude/encode',
+        decode: '/api/tokenizers/claude/decode',
+        count: '/api/tokenizers/claude/encode',
+    },
+    [tokenizers.LLAMA3]: {
+        encode: '/api/tokenizers/llama3/encode',
+        decode: '/api/tokenizers/llama3/decode',
+        count: '/api/tokenizers/llama3/encode',
+    },
+    [tokenizers.GEMMA]: {
+        encode: '/api/tokenizers/gemma/encode',
+        decode: '/api/tokenizers/gemma/decode',
+        count: '/api/tokenizers/gemma/encode',
+    },
+    [tokenizers.JAMBA]: {
+        encode: '/api/tokenizers/jamba/encode',
+        decode: '/api/tokenizers/jamba/decode',
+        count: '/api/tokenizers/jamba/encode',
+    },
+    [tokenizers.QWEN2]: {
+        encode: '/api/tokenizers/qwen2/encode',
+        decode: '/api/tokenizers/qwen2/decode',
+        count: '/api/tokenizers/qwen2/encode',
+    },
+    [tokenizers.COMMAND_R]: {
+        encode: '/api/tokenizers/command-r/encode',
+        decode: '/api/tokenizers/command-r/decode',
+        count: '/api/tokenizers/command-r/encode',
+    },
+    [tokenizers.NEMO]: {
+        encode: '/api/tokenizers/nemo/encode',
+        decode: '/api/tokenizers/nemo/decode',
+        count: '/api/tokenizers/nemo/encode',
+    },
     [tokenizers.API_TEXTGENERATIONWEBUI]: {
         encode: '/api/tokenizers/remote/textgenerationwebui/encode',
         count: '/api/tokenizers/remote/textgenerationwebui/encode',
     },
 };
 
-const objectStore = new localforage.createInstance({ name: 'SillyTavern_ChatCompletions' });
+const objectStore = localforage.createInstance({ name: 'SillyTavern_ChatCompletions' });
 
 let tokenCache = {};
 
@@ -128,9 +182,45 @@ async function resetTokenCache() {
 }
 
 /**
+ * @typedef {object} Tokenizer
+ * @property {number} tokenizerId - The id of the tokenizer option
+ * @property {string} tokenizerKey - Internal name/key of the tokenizer
+ * @property {string} tokenizerName - Human-readable detailed name of the tokenizer (as displayed in the UI)
+ */
+
+/**
+ * Gets all tokenizers available to the user.
+ * @returns {Tokenizer[]} Tokenizer info.
+ */
+export function getAvailableTokenizers() {
+    const tokenizerOptions = $('#tokenizer').find('option').toArray();
+    return tokenizerOptions.map(tokenizerOption => ({
+        tokenizerId: Number(tokenizerOption.value),
+        tokenizerKey: Object.entries(tokenizers).find(([_, value]) => value === Number(tokenizerOption.value))[0].toLocaleLowerCase(),
+        tokenizerName: tokenizerOption.text,
+    }));
+}
+
+/**
+ * Selects tokenizer if not already selected.
+ * @param {number} tokenizerId Tokenizer ID.
+ */
+export function selectTokenizer(tokenizerId) {
+    if (tokenizerId !== power_user.tokenizer) {
+        const tokenizer = getAvailableTokenizers().find(tokenizer => tokenizer.tokenizerId === tokenizerId);
+        if (!tokenizer) {
+            console.warn('Failed to find tokenizer with id', tokenizerId);
+            return;
+        }
+        $('#tokenizer').val(tokenizer.tokenizerId).trigger('change');
+        toastr.info(`Tokenizer: "${tokenizer.tokenizerName}" selected`);
+    }
+}
+
+/**
  * Gets the friendly name of the current tokenizer.
  * @param {string} forApi API to get the tokenizer for. Defaults to the main API.
- * @returns { { tokenizerName: string, tokenizerId: number } } Tokenizer info
+ * @returns {Tokenizer} Tokenizer info
  */
 export function getFriendlyTokenizerName(forApi) {
     if (!forApi) {
@@ -165,7 +255,9 @@ export function getFriendlyTokenizerName(forApi) {
         ? tokenizers.OPENAI
         : tokenizerId;
 
-    return { tokenizerName, tokenizerId };
+    const tokenizerKey = Object.entries(tokenizers).find(([_, value]) => value === tokenizerId)[0].toLocaleLowerCase();
+
+    return { tokenizerName, tokenizerKey, tokenizerId };
 }
 
 /**
@@ -185,6 +277,9 @@ export function getTokenizerBestMatch(forApi) {
         if (nai_settings.model_novel.includes('kayra')) {
             return tokenizers.NERD2;
         }
+        if (nai_settings.model_novel.includes('erato')) {
+            return tokenizers.LLAMA3;
+        }
     }
     if (forApi === 'kobold' || forApi === 'textgenerationwebui' || forApi === 'koboldhorde') {
         // Try to use the API tokenizer if possible:
@@ -192,8 +287,9 @@ export function getTokenizerBestMatch(forApi) {
         // - Kobold must pass a version check
         // - Tokenizer haven't reported an error previously
         const hasTokenizerError = sessionStorage.getItem(TOKENIZER_WARNING_KEY);
+        const hasValidEndpoint = sessionStorage.getItem(TOKENIZER_SUPPORTED_KEY);
         const isConnected = online_status !== 'no_connection';
-        const isTokenizerSupported = TEXTGEN_TOKENIZERS.includes(textgen_settings.type);
+        const isTokenizerSupported = TEXTGEN_TOKENIZERS.includes(textgen_settings.type) && (textgen_settings.type !== textgen_types.OOBA || hasValidEndpoint);
 
         if (!hasTokenizerError && isConnected) {
             if (forApi === 'kobold' && kai_flags.can_use_tokenization) {
@@ -203,8 +299,36 @@ export function getTokenizerBestMatch(forApi) {
             if (forApi === 'textgenerationwebui' && isTokenizerSupported) {
                 return tokenizers.API_TEXTGENERATIONWEBUI;
             }
-            if (forApi === 'textgenerationwebui' && textgen_settings.type === OPENROUTER) {
+            if (forApi === 'textgenerationwebui' && textgen_settings.type === textgen_types.OPENROUTER) {
                 return getCurrentOpenRouterModelTokenizer();
+            }
+            if (forApi === 'textgenerationwebui' && textgen_settings.type === textgen_types.DREAMGEN) {
+                return getCurrentDreamGenModelTokenizer();
+            }
+        }
+
+        if (forApi === 'textgenerationwebui') {
+            const model = String(getTextGenModel() || online_status).toLowerCase();
+            if (model.includes('llama3') || model.includes('llama-3')) {
+                return tokenizers.LLAMA3;
+            }
+            if (model.includes('mistral') || model.includes('mixtral')) {
+                return tokenizers.MISTRAL;
+            }
+            if (model.includes('gemma')) {
+                return tokenizers.GEMMA;
+            }
+            if (model.includes('yi')) {
+                return tokenizers.YI;
+            }
+            if (model.includes('jamba')) {
+                return tokenizers.JAMBA;
+            }
+            if (model.includes('command-r')) {
+                return tokenizers.COMMAND_R;
+            }
+            if (model.includes('qwen2')) {
+                return tokenizers.QWEN2;
             }
         }
 
@@ -254,10 +378,92 @@ function callTokenizer(type, str) {
 }
 
 /**
+ * Calls the underlying tokenizer model to the token count for a string.
+ * @param {number} type Tokenizer type.
+ * @param {string} str String to tokenize.
+ * @returns {Promise<number>} Token count.
+ */
+function callTokenizerAsync(type, str) {
+    return new Promise(resolve => {
+        if (type === tokenizers.NONE) {
+            return resolve(guesstimate(str));
+        }
+
+        switch (type) {
+            case tokenizers.API_CURRENT:
+                return callTokenizerAsync(currentRemoteTokenizerAPI(), str).then(resolve);
+            case tokenizers.API_KOBOLD:
+                return countTokensFromKoboldAPI(str, resolve);
+            case tokenizers.API_TEXTGENERATIONWEBUI:
+                return countTokensFromTextgenAPI(str, resolve);
+            default: {
+                const endpointUrl = TOKENIZER_URLS[type]?.count;
+                if (!endpointUrl) {
+                    console.warn('Unknown tokenizer type', type);
+                    return resolve(apiFailureTokenCount(str));
+                }
+                return countTokensFromServer(endpointUrl, str, resolve);
+            }
+        }
+    });
+}
+
+/**
+ * Gets the token count for a string using the current model tokenizer.
+ * @param {string} str String to tokenize
+ * @param {number | undefined} padding Optional padding tokens. Defaults to 0.
+ * @returns {Promise<number>} Token count.
+ */
+export async function getTokenCountAsync(str, padding = undefined) {
+    if (typeof str !== 'string' || !str?.length) {
+        return 0;
+    }
+
+    let tokenizerType = power_user.tokenizer;
+
+    if (main_api === 'openai') {
+        if (padding === power_user.token_padding) {
+            // For main "shadow" prompt building
+            tokenizerType = tokenizers.NONE;
+        } else {
+            // For extensions and WI
+            return counterWrapperOpenAIAsync(str);
+        }
+    }
+
+    if (tokenizerType === tokenizers.BEST_MATCH) {
+        tokenizerType = getTokenizerBestMatch(main_api);
+    }
+
+    if (padding === undefined) {
+        padding = 0;
+    }
+
+    const cacheObject = getTokenCacheObject();
+    const hash = getStringHash(str);
+    const cacheKey = `${tokenizerType}-${hash}+${padding}`;
+
+    if (typeof cacheObject[cacheKey] === 'number') {
+        return cacheObject[cacheKey];
+    }
+
+    const result = (await callTokenizerAsync(tokenizerType, str)) + padding;
+
+    if (isNaN(result)) {
+        console.warn('Token count calculation returned NaN');
+        return 0;
+    }
+
+    cacheObject[cacheKey] = result;
+    return result;
+}
+
+/**
  * Gets the token count for a string using the current model tokenizer.
  * @param {string} str String to tokenize
  * @param {number | undefined} padding Optional padding tokens. Defaults to 0.
  * @returns {number} Token count.
+ * @deprecated Use getTokenCountAsync instead.
  */
 export function getTokenCount(str, padding = undefined) {
     if (typeof str !== 'string' || !str?.length) {
@@ -307,10 +513,21 @@ export function getTokenCount(str, padding = undefined) {
  * Gets the token count for a string using the OpenAI tokenizer.
  * @param {string} text Text to tokenize.
  * @returns {number} Token count.
+ * @deprecated Use counterWrapperOpenAIAsync instead.
  */
 function counterWrapperOpenAI(text) {
     const message = { role: 'system', content: text };
     return countTokensOpenAI(message, true);
+}
+
+/**
+ * Gets the token count for a string using the OpenAI tokenizer.
+ * @param {string} text Text to tokenize.
+ * @returns {Promise<number>} Token count.
+ */
+function counterWrapperOpenAIAsync(text) {
+    const message = { role: 'system', content: text };
+    return countTokensOpenAIAsync(message, true);
 }
 
 export function getTokenizerModel() {
@@ -322,11 +539,18 @@ export function getTokenizerModel() {
     const turbo0301Tokenizer = 'gpt-3.5-turbo-0301';
     const turboTokenizer = 'gpt-3.5-turbo';
     const gpt4Tokenizer = 'gpt-4';
+    const gpt4oTokenizer = 'gpt-4o';
     const gpt2Tokenizer = 'gpt2';
     const claudeTokenizer = 'claude';
     const llamaTokenizer = 'llama';
+    const llama3Tokenizer = 'llama3';
     const mistralTokenizer = 'mistral';
     const yiTokenizer = 'yi';
+    const gemmaTokenizer = 'gemma';
+    const jambaTokenizer = 'jamba';
+    const qwen2Tokenizer = 'qwen2';
+    const commandRTokenizer = 'command-r';
+    const nemoTokenizer = 'nemo';
 
     // Assuming no one would use it for different models.. right?
     if (oai_settings.chat_completion_source == chat_completion_sources.SCALE) {
@@ -354,7 +578,7 @@ export function getTokenizerModel() {
 
     // And for OpenRouter (if not a site model, then it's impossible to determine the tokenizer)
     if (main_api == 'openai' && oai_settings.chat_completion_source == chat_completion_sources.OPENROUTER && oai_settings.openrouter_model ||
-        main_api == 'textgenerationwebui' && textgen_settings.type === OPENROUTER && textgen_settings.openrouter_model) {
+        main_api == 'textgenerationwebui' && textgen_settings.type === textgen_types.OPENROUTER && textgen_settings.openrouter_model) {
         const model = main_api == 'openai'
             ? model_list.find(x => x.id === oai_settings.openrouter_model)
             : openRouterModels.find(x => x.id === textgen_settings.openrouter_model);
@@ -362,11 +586,26 @@ export function getTokenizerModel() {
         if (model?.architecture?.tokenizer === 'Llama2') {
             return llamaTokenizer;
         }
+        else if (model?.architecture?.tokenizer === 'Llama3') {
+            return llama3Tokenizer;
+        }
         else if (model?.architecture?.tokenizer === 'Mistral') {
             return mistralTokenizer;
         }
         else if (model?.architecture?.tokenizer === 'Yi') {
             return yiTokenizer;
+        }
+        else if (model?.architecture?.tokenizer === 'Gemini') {
+            return gemmaTokenizer;
+        }
+        else if (model?.architecture?.tokenizer === 'Qwen') {
+            return qwen2Tokenizer;
+        }
+        else if (model?.architecture?.tokenizer === 'Cohere') {
+            return commandRTokenizer;
+        }
+        else if (oai_settings.openrouter_model.includes('gpt-4o')) {
+            return gpt4oTokenizer;
         }
         else if (oai_settings.openrouter_model.includes('gpt-4')) {
             return gpt4Tokenizer;
@@ -383,10 +622,21 @@ export function getTokenizerModel() {
         else if (oai_settings.openrouter_model.includes('GPT-NeoXT')) {
             return gpt2Tokenizer;
         }
+        else if (oai_settings.openrouter_model.includes('jamba')) {
+            return jambaTokenizer;
+        }
+    }
+
+    if (oai_settings.chat_completion_source == chat_completion_sources.COHERE) {
+        return commandRTokenizer;
     }
 
     if (oai_settings.chat_completion_source == chat_completion_sources.MAKERSUITE) {
-        return oai_settings.google_model;
+        return gemmaTokenizer;
+    }
+
+    if (oai_settings.chat_completion_source == chat_completion_sources.AI21) {
+        return jambaTokenizer;
     }
 
     if (oai_settings.chat_completion_source == chat_completion_sources.CLAUDE) {
@@ -394,11 +644,51 @@ export function getTokenizerModel() {
     }
 
     if (oai_settings.chat_completion_source == chat_completion_sources.MISTRALAI) {
+        if (oai_settings.mistralai_model.includes('nemo') || oai_settings.mistralai_model.includes('pixtral')) {
+            return nemoTokenizer;
+        }
         return mistralTokenizer;
     }
 
     if (oai_settings.chat_completion_source == chat_completion_sources.CUSTOM) {
         return oai_settings.custom_model;
+    }
+
+    if (oai_settings.chat_completion_source === chat_completion_sources.PERPLEXITY) {
+        if (oai_settings.perplexity_model.includes('llama-3') || oai_settings.perplexity_model.includes('llama3')) {
+            return llama3Tokenizer;
+        }
+        if (oai_settings.perplexity_model.includes('llama')) {
+            return llamaTokenizer;
+        }
+        if (oai_settings.perplexity_model.includes('mistral') || oai_settings.perplexity_model.includes('mixtral')) {
+            return mistralTokenizer;
+        }
+    }
+
+    if (oai_settings.chat_completion_source === chat_completion_sources.GROQ) {
+        if (oai_settings.groq_model.includes('llama-3') || oai_settings.groq_model.includes('llama3')) {
+            return llama3Tokenizer;
+        }
+        if (oai_settings.groq_model.includes('mistral') || oai_settings.groq_model.includes('mixtral')) {
+            return mistralTokenizer;
+        }
+        if (oai_settings.groq_model.includes('gemma')) {
+            return gemmaTokenizer;
+        }
+    }
+
+    if (oai_settings.chat_completion_source === chat_completion_sources.ZEROONEAI) {
+        return yiTokenizer;
+    }
+
+    if (oai_settings.chat_completion_source === chat_completion_sources.BLOCKENTROPY) {
+        if (oai_settings.blockentropy_model.includes('llama3')) {
+            return llama3Tokenizer;
+        }
+        if (oai_settings.blockentropy_model.includes('miqu') || oai_settings.blockentropy_model.includes('mixtral')) {
+            return mistralTokenizer;
+        }
     }
 
     // Default to Turbo 3.5
@@ -407,18 +697,10 @@ export function getTokenizerModel() {
 
 /**
  * @param {any[] | Object} messages
+ * @deprecated Use countTokensOpenAIAsync instead.
  */
 export function countTokensOpenAI(messages, full = false) {
-    const shouldTokenizeAI21 = oai_settings.chat_completion_source === chat_completion_sources.AI21 && oai_settings.use_ai21_tokenizer;
-    const shouldTokenizeGoogle = oai_settings.chat_completion_source === chat_completion_sources.MAKERSUITE && oai_settings.use_google_tokenizer;
-    let tokenizerEndpoint = '';
-    if (shouldTokenizeAI21) {
-        tokenizerEndpoint = '/api/tokenizers/ai21/count';
-    } else if (shouldTokenizeGoogle) {
-        tokenizerEndpoint = `/api/tokenizers/google/count?model=${getTokenizerModel()}`;
-    } else {
-        tokenizerEndpoint = `/api/tokenizers/openai/count?model=${getTokenizerModel()}`;
-    }
+    const tokenizerEndpoint = `/api/tokenizers/openai/count?model=${getTokenizerModel()}`;
     const cacheObject = getTokenCacheObject();
 
     if (!Array.isArray(messages)) {
@@ -430,7 +712,7 @@ export function countTokensOpenAI(messages, full = false) {
     for (const message of messages) {
         const model = getTokenizerModel();
 
-        if (model === 'claude' || shouldTokenizeAI21 || shouldTokenizeGoogle) {
+        if (model === 'claude') {
             full = true;
         }
 
@@ -455,6 +737,57 @@ export function countTokensOpenAI(messages, full = false) {
                     cacheObject[cacheKey] = Number(data.token_count);
                 },
             });
+        }
+    }
+
+    if (!full) token_count -= 2;
+
+    return token_count;
+}
+
+/**
+ * Returns the token count for a message using the OpenAI tokenizer.
+ * @param {object[]|object} messages
+ * @param {boolean} full
+ * @returns {Promise<number>} Token count.
+ */
+export async function countTokensOpenAIAsync(messages, full = false) {
+    const tokenizerEndpoint = `/api/tokenizers/openai/count?model=${getTokenizerModel()}`;
+    const cacheObject = getTokenCacheObject();
+
+    if (!Array.isArray(messages)) {
+        messages = [messages];
+    }
+
+    let token_count = -1;
+
+    for (const message of messages) {
+        const model = getTokenizerModel();
+
+        if (model === 'claude') {
+            full = true;
+        }
+
+        const hash = getStringHash(JSON.stringify(message));
+        const cacheKey = `${model}-${hash}`;
+        const cachedCount = cacheObject[cacheKey];
+
+        if (typeof cachedCount === 'number') {
+            token_count += cachedCount;
+        }
+
+        else {
+            const data = await jQuery.ajax({
+                async: true,
+                type: 'POST', //
+                url: tokenizerEndpoint,
+                data: JSON.stringify([message]),
+                dataType: 'json',
+                contentType: 'application/json',
+            });
+
+            token_count += Number(data.token_count);
+            cacheObject[cacheKey] = Number(data.token_count);
         }
     }
 
@@ -492,13 +825,15 @@ function getTokenCacheObject() {
  * Count tokens using the server API.
  * @param {string} endpoint API endpoint.
  * @param {string} str String to tokenize.
+ * @param {function} [resolve] Promise resolve function.s
  * @returns {number} Token count.
  */
-function countTokensFromServer(endpoint, str) {
+function countTokensFromServer(endpoint, str, resolve) {
+    const isAsync = typeof resolve === 'function';
     let tokenCount = 0;
 
     jQuery.ajax({
-        async: false,
+        async: isAsync,
         type: 'POST',
         url: endpoint,
         data: JSON.stringify({ text: str }),
@@ -510,6 +845,8 @@ function countTokensFromServer(endpoint, str) {
             } else {
                 tokenCount = apiFailureTokenCount(str);
             }
+
+            isAsync && resolve(tokenCount);
         },
     });
 
@@ -519,13 +856,15 @@ function countTokensFromServer(endpoint, str) {
 /**
  * Count tokens using the AI provider's API.
  * @param {string} str String to tokenize.
+ * @param {function} [resolve] Promise resolve function.
  * @returns {number} Token count.
  */
-function countTokensFromKoboldAPI(str) {
+function countTokensFromKoboldAPI(str, resolve) {
+    const isAsync = typeof resolve === 'function';
     let tokenCount = 0;
 
     jQuery.ajax({
-        async: false,
+        async: isAsync,
         type: 'POST',
         url: TOKENIZER_URLS[tokenizers.API_KOBOLD].count,
         data: JSON.stringify({
@@ -540,6 +879,8 @@ function countTokensFromKoboldAPI(str) {
             } else {
                 tokenCount = apiFailureTokenCount(str);
             }
+
+            isAsync && resolve(tokenCount);
         },
     });
 
@@ -551,20 +892,23 @@ function getTextgenAPITokenizationParams(str) {
         text: str,
         api_type: textgen_settings.type,
         url: getTextGenServer(),
-        legacy_api: textgen_settings.legacy_api && (textgen_settings.type === OOBA || textgen_settings.type === APHRODITE),
+        vllm_model: textgen_settings.vllm_model,
+        aphrodite_model: textgen_settings.aphrodite_model,
     };
 }
 
 /**
  * Count tokens using the AI provider's API.
  * @param {string} str String to tokenize.
+ * @param {function} [resolve] Promise resolve function.
  * @returns {number} Token count.
  */
-function countTokensFromTextgenAPI(str) {
+function countTokensFromTextgenAPI(str, resolve) {
+    const isAsync = typeof resolve === 'function';
     let tokenCount = 0;
 
     jQuery.ajax({
-        async: false,
+        async: isAsync,
         type: 'POST',
         url: TOKENIZER_URLS[tokenizers.API_TEXTGENERATIONWEBUI].count,
         data: JSON.stringify(getTextgenAPITokenizationParams(str)),
@@ -576,6 +920,8 @@ function countTokensFromTextgenAPI(str) {
             } else {
                 tokenCount = apiFailureTokenCount(str);
             }
+
+            isAsync && resolve(tokenCount);
         },
     });
 
@@ -584,15 +930,20 @@ function countTokensFromTextgenAPI(str) {
 
 function apiFailureTokenCount(str) {
     console.error('Error counting tokens');
+    let shouldTryAgain = false;
 
     if (!sessionStorage.getItem(TOKENIZER_WARNING_KEY)) {
-        toastr.warning(
-            'Your selected API doesn\'t support the tokenization endpoint. Using estimated counts.',
-            'Error counting tokens',
-            { timeOut: 10000, preventDuplicates: true },
-        );
-
+        const bestMatchBefore = getTokenizerBestMatch(main_api);
         sessionStorage.setItem(TOKENIZER_WARNING_KEY, String(true));
+        const bestMatchAfter = getTokenizerBestMatch(main_api);
+        if ([tokenizers.API_TEXTGENERATIONWEBUI, tokenizers.API_KOBOLD].includes(bestMatchBefore) && bestMatchBefore !== bestMatchAfter) {
+            shouldTryAgain = true;
+        }
+    }
+
+    // Only try again if we guarantee not to be looped by the same error
+    if (shouldTryAgain && power_user.tokenizer === tokenizers.BEST_MATCH) {
+        return getTokenCount(str);
     }
 
     return guesstimate(str);
@@ -602,12 +953,14 @@ function apiFailureTokenCount(str) {
  * Calls the underlying tokenizer model to encode a string to tokens.
  * @param {string} endpoint API endpoint.
  * @param {string} str String to tokenize.
+ * @param {function} [resolve] Promise resolve function.
  * @returns {number[]} Array of token ids.
  */
-function getTextTokensFromServer(endpoint, str) {
+function getTextTokensFromServer(endpoint, str, resolve) {
+    const isAsync = typeof resolve === 'function';
     let ids = [];
     jQuery.ajax({
-        async: false,
+        async: isAsync,
         type: 'POST',
         url: endpoint,
         data: JSON.stringify({ text: str }),
@@ -620,6 +973,8 @@ function getTextTokensFromServer(endpoint, str) {
             if (Array.isArray(data.chunks)) {
                 Object.defineProperty(ids, 'chunks', { value: data.chunks });
             }
+
+            isAsync && resolve(ids);
         },
     });
     return ids;
@@ -628,12 +983,14 @@ function getTextTokensFromServer(endpoint, str) {
 /**
  * Calls the AI provider's tokenize API to encode a string to tokens.
  * @param {string} str String to tokenize.
+ * @param {function} [resolve] Promise resolve function.
  * @returns {number[]} Array of token ids.
  */
-function getTextTokensFromTextgenAPI(str) {
+function getTextTokensFromTextgenAPI(str, resolve) {
+    const isAsync = typeof resolve === 'function';
     let ids = [];
     jQuery.ajax({
-        async: false,
+        async: isAsync,
         type: 'POST',
         url: TOKENIZER_URLS[tokenizers.API_TEXTGENERATIONWEBUI].encode,
         data: JSON.stringify(getTextgenAPITokenizationParams(str)),
@@ -641,6 +998,7 @@ function getTextTokensFromTextgenAPI(str) {
         contentType: 'application/json',
         success: function (data) {
             ids = data.ids;
+            isAsync && resolve(ids);
         },
     });
     return ids;
@@ -649,13 +1007,15 @@ function getTextTokensFromTextgenAPI(str) {
 /**
  * Calls the AI provider's tokenize API to encode a string to tokens.
  * @param {string} str String to tokenize.
+ * @param {function} [resolve] Promise resolve function.
  * @returns {number[]} Array of token ids.
  */
-function getTextTokensFromKoboldAPI(str) {
+function getTextTokensFromKoboldAPI(str, resolve) {
+    const isAsync = typeof resolve === 'function';
     let ids = [];
 
     jQuery.ajax({
-        async: false,
+        async: isAsync,
         type: 'POST',
         url: TOKENIZER_URLS[tokenizers.API_KOBOLD].encode,
         data: JSON.stringify({
@@ -666,6 +1026,7 @@ function getTextTokensFromKoboldAPI(str) {
         contentType: 'application/json',
         success: function (data) {
             ids = data.ids;
+            isAsync && resolve(ids);
         },
     });
 
@@ -676,13 +1037,15 @@ function getTextTokensFromKoboldAPI(str) {
  * Calls the underlying tokenizer model to decode token ids to text.
  * @param {string} endpoint API endpoint.
  * @param {number[]} ids Array of token ids
+ * @param {function} [resolve] Promise resolve function.
  * @returns {({ text: string, chunks?: string[] })} Decoded token text as a single string and individual chunks (if available).
  */
-function decodeTextTokensFromServer(endpoint, ids) {
+function decodeTextTokensFromServer(endpoint, ids, resolve) {
+    const isAsync = typeof resolve === 'function';
     let text = '';
     let chunks = [];
     jQuery.ajax({
-        async: false,
+        async: isAsync,
         type: 'POST',
         url: endpoint,
         data: JSON.stringify({ ids: ids }),
@@ -691,6 +1054,7 @@ function decodeTextTokensFromServer(endpoint, ids) {
         success: function (data) {
             text = data.text;
             chunks = data.chunks;
+            isAsync && resolve({ text, chunks });
         },
     });
     return { text, chunks };
@@ -759,6 +1123,14 @@ export function decodeTextTokens(tokenizerType, ids) {
 }
 
 export async function initTokenizers() {
+    TEXTGEN_TOKENIZERS.push(
+        textgen_types.OOBA,
+        textgen_types.TABBY,
+        textgen_types.KOBOLDCPP,
+        textgen_types.LLAMACPP,
+        textgen_types.VLLM,
+        textgen_types.APHRODITE,
+    );
     await loadTokenCache();
     registerDebugFunction('resetTokenCache', 'Reset token cache', 'Purges the calculated token counts. Use this if you want to force a full re-tokenization of all chats or suspect the token counts are wrong.', resetTokenCache);
 }

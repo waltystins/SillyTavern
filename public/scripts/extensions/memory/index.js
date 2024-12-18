@@ -1,11 +1,33 @@
-import { getStringHash, debounce, waitUntilCondition, extractAllWords } from '../../utils.js';
-import { getContext, getApiUrl, extension_settings, doExtrasFetch, modules } from '../../extensions.js';
-import { animation_duration, eventSource, event_types, extension_prompt_types, generateQuietPrompt, is_send_press, saveSettingsDebounced, substituteParams } from '../../../script.js';
+import { getStringHash, debounce, waitUntilCondition, extractAllWords, isTrueBoolean } from '../../utils.js';
+import { getContext, getApiUrl, extension_settings, doExtrasFetch, modules, renderExtensionTemplateAsync } from '../../extensions.js';
+import {
+    activateSendButtons,
+    deactivateSendButtons,
+    animation_duration,
+    eventSource,
+    event_types,
+    extension_prompt_roles,
+    extension_prompt_types,
+    generateQuietPrompt,
+    is_send_press,
+    saveSettingsDebounced,
+    substituteParamsExtended,
+    generateRaw,
+    getMaxContextSize,
+    setExtensionPrompt,
+    streamingProcessor,
+} from '../../../script.js';
 import { is_group_generating, selected_group } from '../../group-chats.js';
-import { registerSlashCommand } from '../../slash-commands.js';
 import { loadMovingUIState } from '../../power-user.js';
 import { dragElement } from '../../RossAscends-mods.js';
-import { getTextTokens, tokenizers } from '../../tokenizers.js';
+import { getTextTokens, getTokenCountAsync, tokenizers } from '../../tokenizers.js';
+import { debounce_timeout } from '../../constants.js';
+import { SlashCommandParser } from '../../slash-commands/SlashCommandParser.js';
+import { SlashCommand } from '../../slash-commands/SlashCommand.js';
+import { ARGUMENT_TYPE, SlashCommandArgument, SlashCommandNamedArgument } from '../../slash-commands/SlashCommandArgument.js';
+import { MacrosParser } from '../../macros.js';
+import { countWebLlmTokens, generateWebLlmChatPrompt, getWebLlmContextSize, isWebLlmSupported } from '../shared.js';
+import { commonEnumProviders } from '../../slash-commands/SlashCommandCommonEnumsProvider.js';
 export { MODULE_NAME };
 
 const MODULE_NAME = '1_memory';
@@ -17,6 +39,41 @@ let lastMessageHash = null;
 let lastMessageId = null;
 let inApiCall = false;
 
+/**
+ * Count the number of tokens in the provided text.
+ * @param {string} text Text to count tokens for
+ * @param {number} padding Number of additional tokens to add to the count
+ * @returns {Promise<number>} Number of tokens in the text
+ */
+async function countSourceTokens(text, padding = 0) {
+    if (extension_settings.memory.source === summary_sources.webllm) {
+        const count = await countWebLlmTokens(text);
+        return count + padding;
+    }
+
+    if (extension_settings.memory.source === summary_sources.extras) {
+        const count = getTextTokens(tokenizers.GPT2, text).length;
+        return count + padding;
+    }
+
+    return await getTokenCountAsync(text, padding);
+}
+
+async function getSourceContextSize() {
+    const overrideLength = extension_settings.memory.overrideResponseLength;
+
+    if (extension_settings.memory.source === summary_sources.webllm) {
+        const maxContext = await getWebLlmContextSize();
+        return overrideLength > 0 ? (maxContext - overrideLength) : Math.round(maxContext * 0.75);
+    }
+
+    if (extension_settings.source === summary_sources.extras) {
+        return 1024 - 64;
+    }
+
+    return getMaxContextSize(overrideLength);
+}
+
 const formatMemoryValue = function (value) {
     if (!value) {
         return '';
@@ -25,21 +82,27 @@ const formatMemoryValue = function (value) {
     value = value.trim();
 
     if (extension_settings.memory.template) {
-        let result = extension_settings.memory.template.replace(/{{summary}}/i, value);
-        return substituteParams(result);
+        return substituteParamsExtended(extension_settings.memory.template, { summary: value });
     } else {
         return `Summary: ${value}`;
     }
 };
 
-const saveChatDebounced = debounce(() => getContext().saveChat(), 2000);
+const saveChatDebounced = debounce(() => getContext().saveChat(), debounce_timeout.relaxed);
 
 const summary_sources = {
     'extras': 'extras',
     'main': 'main',
+    'webllm': 'webllm',
 };
 
-const defaultPrompt = '[Pause your roleplay. Summarize the most important facts and events that have happened in the chat so far. If a summary already exists in your memory, use that as a base and expand with new facts. Limit the summary to {{words}} words or less. Your response should include nothing but the summary.]';
+const prompt_builders = {
+    DEFAULT: 0,
+    RAW_BLOCKING: 1,
+    RAW_NON_BLOCKING: 2,
+};
+
+const defaultPrompt = 'Ignore previous instructions. Summarize the most important facts and events in the story so far. If a summary already exists in your memory, use that as a base and expand with new facts. Limit the summary to {{words}} words or less. Your response should include nothing but the summary.';
 const defaultTemplate = '[Summary: {{summary}}]';
 
 const defaultSettings = {
@@ -49,6 +112,8 @@ const defaultSettings = {
     prompt: defaultPrompt,
     template: defaultTemplate,
     position: extension_prompt_types.IN_PROMPT,
+    role: extension_prompt_roles.SYSTEM,
+    scan: false,
     depth: 2,
     promptWords: 200,
     promptMinWords: 25,
@@ -56,12 +121,21 @@ const defaultSettings = {
     promptWordsStep: 25,
     promptInterval: 10,
     promptMinInterval: 0,
-    promptMaxInterval: 100,
+    promptMaxInterval: 250,
     promptIntervalStep: 1,
     promptForceWords: 0,
     promptForceWordsStep: 100,
     promptMinForceWords: 0,
     promptMaxForceWords: 10000,
+    overrideResponseLength: 0,
+    overrideResponseLengthMin: 0,
+    overrideResponseLengthMax: 4096,
+    overrideResponseLengthStep: 16,
+    maxMessagesPerRequest: 0,
+    maxMessagesPerRequestMin: 0,
+    maxMessagesPerRequestMax: 250,
+    maxMessagesPerRequestStep: 1,
+    prompt_builder: prompt_builders.DEFAULT,
 };
 
 function loadSettings() {
@@ -83,9 +157,90 @@ function loadSettings() {
     $('#memory_prompt_interval').val(extension_settings.memory.promptInterval).trigger('input');
     $('#memory_template').val(extension_settings.memory.template).trigger('input');
     $('#memory_depth').val(extension_settings.memory.depth).trigger('input');
+    $('#memory_role').val(extension_settings.memory.role).trigger('input');
     $(`input[name="memory_position"][value="${extension_settings.memory.position}"]`).prop('checked', true).trigger('input');
     $('#memory_prompt_words_force').val(extension_settings.memory.promptForceWords).trigger('input');
+    $(`input[name="memory_prompt_builder"][value="${extension_settings.memory.prompt_builder}"]`).prop('checked', true).trigger('input');
+    $('#memory_override_response_length').val(extension_settings.memory.overrideResponseLength).trigger('input');
+    $('#memory_max_messages_per_request').val(extension_settings.memory.maxMessagesPerRequest).trigger('input');
+    $('#memory_include_wi_scan').prop('checked', extension_settings.memory.scan).trigger('input');
     switchSourceControls(extension_settings.memory.source);
+}
+
+async function onPromptForceWordsAutoClick() {
+    const context = getContext();
+    const maxPromptLength = await getSourceContextSize();
+    const chat = context.chat;
+    const allMessages = chat.filter(m => !m.is_system && m.mes).map(m => m.mes);
+    const messagesWordCount = allMessages.map(m => extractAllWords(m)).flat().length;
+    const averageMessageWordCount = messagesWordCount / allMessages.length;
+    const tokensPerWord = await countSourceTokens(allMessages.join('\n')) / messagesWordCount;
+    const wordsPerToken = 1 / tokensPerWord;
+    const maxPromptLengthWords = Math.round(maxPromptLength * wordsPerToken);
+    // How many words should pass so that messages will start be dropped out of context;
+    const wordsPerPrompt = Math.floor(maxPromptLength / tokensPerWord);
+    // How many words will be needed to fit the allowance buffer
+    const summaryPromptWords = extractAllWords(extension_settings.memory.prompt).length;
+    const promptAllowanceWords = maxPromptLengthWords - extension_settings.memory.promptWords - summaryPromptWords;
+    const averageMessagesPerPrompt = Math.floor(promptAllowanceWords / averageMessageWordCount);
+    const maxMessagesPerSummary = extension_settings.memory.maxMessagesPerRequest || 0;
+    const targetMessagesInPrompt = maxMessagesPerSummary > 0 ? maxMessagesPerSummary : Math.max(0, averageMessagesPerPrompt);
+    const targetSummaryWords = (targetMessagesInPrompt * averageMessageWordCount) + (promptAllowanceWords / 4);
+
+    console.table({
+        maxPromptLength,
+        maxPromptLengthWords,
+        promptAllowanceWords,
+        averageMessagesPerPrompt,
+        targetMessagesInPrompt,
+        targetSummaryWords,
+        wordsPerPrompt,
+        wordsPerToken,
+        tokensPerWord,
+        messagesWordCount,
+    });
+
+    const ROUNDING = 100;
+    extension_settings.memory.promptForceWords = Math.max(1, Math.floor(targetSummaryWords / ROUNDING) * ROUNDING);
+    $('#memory_prompt_words_force').val(extension_settings.memory.promptForceWords).trigger('input');
+}
+
+async function onPromptIntervalAutoClick() {
+    const context = getContext();
+    const maxPromptLength = await getSourceContextSize();
+    const chat = context.chat;
+    const allMessages = chat.filter(m => !m.is_system && m.mes).map(m => m.mes);
+    const messagesWordCount = allMessages.map(m => extractAllWords(m)).flat().length;
+    const messagesTokenCount = await countSourceTokens(allMessages.join('\n'));
+    const tokensPerWord = messagesTokenCount / messagesWordCount;
+    const averageMessageTokenCount = messagesTokenCount / allMessages.length;
+    const targetSummaryTokens = Math.round(extension_settings.memory.promptWords * tokensPerWord);
+    const promptTokens = await countSourceTokens(extension_settings.memory.prompt);
+    const promptAllowance = maxPromptLength - promptTokens - targetSummaryTokens;
+    const maxMessagesPerSummary = extension_settings.memory.maxMessagesPerRequest || 0;
+    const averageMessagesPerPrompt = Math.floor(promptAllowance / averageMessageTokenCount);
+    const targetMessagesInPrompt = maxMessagesPerSummary > 0 ? maxMessagesPerSummary : Math.max(0, averageMessagesPerPrompt);
+    const adjustedAverageMessagesPerPrompt = targetMessagesInPrompt + (averageMessagesPerPrompt - targetMessagesInPrompt) / 4;
+
+    console.table({
+        maxPromptLength,
+        promptAllowance,
+        targetSummaryTokens,
+        promptTokens,
+        messagesWordCount,
+        messagesTokenCount,
+        tokensPerWord,
+        averageMessageTokenCount,
+        averageMessagesPerPrompt,
+        targetMessagesInPrompt,
+        adjustedAverageMessagesPerPrompt,
+        maxMessagesPerSummary,
+    });
+
+    const ROUNDING = 5;
+    extension_settings.memory.promptInterval = Math.max(1, Math.floor(adjustedAverageMessagesPerPrompt / ROUNDING) * ROUNDING);
+
+    $('#memory_prompt_interval').val(extension_settings.memory.promptInterval).trigger('input');
 }
 
 function onSummarySourceChange(event) {
@@ -96,9 +251,9 @@ function onSummarySourceChange(event) {
 }
 
 function switchSourceControls(value) {
-    $('#memory_settings [data-source]').each((_, element) => {
-        const source = $(element).data('source');
-        $(element).toggle(source === value);
+    $('#memory_settings [data-summary-source]').each((_, element) => {
+        const source = element.dataset.summarySource.split(',').map(s => s.trim());
+        $(element).toggle(source.includes(value));
     });
 }
 
@@ -128,6 +283,10 @@ function onMemoryPromptIntervalInput() {
     saveSettingsDebounced();
 }
 
+function onMemoryPromptRestoreClick() {
+    $('#memory_prompt').val(defaultPrompt).trigger('input');
+}
+
 function onMemoryPromptInput() {
     const value = $(this).val();
     extension_settings.memory.prompt = value;
@@ -148,9 +307,23 @@ function onMemoryDepthInput() {
     saveSettingsDebounced();
 }
 
+function onMemoryRoleInput() {
+    const value = $(this).val();
+    extension_settings.memory.role = Number(value);
+    reinsertMemory();
+    saveSettingsDebounced();
+}
+
 function onMemoryPositionChange(e) {
     const value = e.target.value;
     extension_settings.memory.position = value;
+    reinsertMemory();
+    saveSettingsDebounced();
+}
+
+function onMemoryIncludeWIScanInput() {
+    const value = !!$(this).prop('checked');
+    extension_settings.memory.scan = value;
     reinsertMemory();
     saveSettingsDebounced();
 }
@@ -159,6 +332,20 @@ function onMemoryPromptWordsForceInput() {
     const value = $(this).val();
     extension_settings.memory.promptForceWords = Number(value);
     $('#memory_prompt_words_force_value').text(extension_settings.memory.promptForceWords);
+    saveSettingsDebounced();
+}
+
+function onOverrideResponseLengthInput() {
+    const value = $(this).val();
+    extension_settings.memory.overrideResponseLength = Number(value);
+    $('#memory_override_response_length_value').text(extension_settings.memory.overrideResponseLength);
+    saveSettingsDebounced();
+}
+
+function onMaxMessagesPerRequestInput() {
+    const value = $(this).val();
+    extension_settings.memory.maxMessagesPerRequest = Number(value);
+    $('#memory_max_messages_per_request_value').text(extension_settings.memory.maxMessagesPerRequest);
     saveSettingsDebounced();
 }
 
@@ -187,12 +374,31 @@ function getLatestMemoryFromChat(chat) {
     return '';
 }
 
+function getIndexOfLatestChatSummary(chat) {
+    if (!Array.isArray(chat) || !chat.length) {
+        return -1;
+    }
+
+    const reversedChat = chat.slice().reverse();
+    reversedChat.shift();
+    for (let mes of reversedChat) {
+        if (mes.extra && mes.extra.memory) {
+            return chat.indexOf(mes);
+        }
+    }
+
+    return -1;
+}
+
 async function onChatEvent() {
     // Module not enabled
-    if (extension_settings.memory.source === summary_sources.extras) {
-        if (!modules.includes('summarize')) {
-            return;
-        }
+    if (extension_settings.memory.source === summary_sources.extras && !modules.includes('summarize')) {
+        return;
+    }
+
+    // WebLLM is not supported
+    if (extension_settings.memory.source === summary_sources.webllm && !isWebLlmSupported()) {
+        return;
     }
 
     const context = getContext();
@@ -203,8 +409,8 @@ async function onChatEvent() {
         return;
     }
 
-    // Generation is in progress, summary prevented
-    if (is_send_press) {
+    // Streaming in-progress
+    if (streamingProcessor && !streamingProcessor.isFinished) {
         return;
     }
 
@@ -241,18 +447,17 @@ async function onChatEvent() {
         delete chat[chat.length - 1].extra.memory;
     }
 
-    try {
-        await summarizeChat(context);
-    }
-    catch (error) {
-        console.log(error);
-    }
-    finally {
-        saveLastValues();
-    }
+    summarizeChat(context)
+        .catch(console.error)
+        .finally(saveLastValues);
 }
 
-async function forceSummarizeChat() {
+/**
+ * Forces a summary generation for the current chat.
+ * @param {boolean} quiet If an informational toast should be displayed
+ * @returns {Promise<string>} Summarized text
+ */
+async function forceSummarizeChat(quiet) {
     if (extension_settings.memory.source === summary_sources.extras) {
         toastr.warning('Force summarization is not supported for Extras API');
         return;
@@ -264,15 +469,60 @@ async function forceSummarizeChat() {
     console.log(`Skipping WIAN? ${skipWIAN}`);
     if (!context.chatId) {
         toastr.warning('No chat selected');
-        return;
+        return '';
     }
 
-    toastr.info('Summarizing chat...', 'Please wait');
-    const value = await summarizeChatMain(context, true, skipWIAN);
+    const toast = quiet ? jQuery() : toastr.info('Summarizing chat...', 'Please wait', { timeOut: 0, extendedTimeOut: 0 });
+    const value = extension_settings.memory.source === summary_sources.main
+        ? await summarizeChatMain(context, true, skipWIAN)
+        : await summarizeChatWebLLM(context, true);
+
+    toastr.clear(toast);
 
     if (!value) {
         toastr.warning('Failed to summarize chat');
-        return;
+        return '';
+    }
+
+    return value;
+}
+
+/**
+ * Callback for the summarize command.
+ * @param {object} args Command arguments
+ * @param {string} text Text to summarize
+ */
+async function summarizeCallback(args, text) {
+    text = text.trim();
+
+    // Summarize the current chat if no text provided
+    if (!text) {
+        const quiet = isTrueBoolean(args.quiet);
+        return await forceSummarizeChat(quiet);
+    }
+
+    const source = args.source || extension_settings.memory.source;
+    const prompt = substituteParamsExtended((args.prompt || extension_settings.memory.prompt), { words: extension_settings.memory.promptWords });
+
+    try {
+        switch (source) {
+            case summary_sources.extras:
+                return await callExtrasSummarizeAPI(text);
+            case summary_sources.main:
+                return await generateRaw(text, '', false, false, prompt, extension_settings.memory.overrideResponseLength);
+            case summary_sources.webllm: {
+                const messages = [{ role: 'system', content: prompt }, { role: 'user', content: text }].filter(m => m.content);
+                const params = extension_settings.memory.overrideResponseLength > 0 ? { max_tokens: extension_settings.memory.overrideResponseLength } : {};
+                return await generateWebLlmChatPrompt(messages, params);
+            }
+            default:
+                toastr.warning('Invalid summarization source specified');
+                return '';
+        }
+    } catch (error) {
+        toastr.error(String(error), 'Failed to summarize text');
+        console.log(error);
+        return '';
     }
 }
 
@@ -285,16 +535,25 @@ async function summarizeChat(context) {
         case summary_sources.main:
             await summarizeChatMain(context, false, skipWIAN);
             break;
+        case summary_sources.webllm:
+            await summarizeChatWebLLM(context, false);
+            break;
         default:
             break;
     }
 }
 
-async function summarizeChatMain(context, force, skipWIAN) {
-
+/**
+ * Check if the chat should be summarized based on the current conditions.
+ * Return summary prompt if it should be summarized.
+ * @param {any} context ST context
+ * @param {boolean} force Summarize the chat regardless of the conditions
+ * @returns {Promise<string>} Summary prompt or empty string
+ */
+async function getSummaryPromptForNow(context, force) {
     if (extension_settings.memory.promptInterval === 0 && !force) {
         console.debug('Prompt interval is set to 0, skipping summarization');
-        return;
+        return '';
     }
 
     try {
@@ -303,20 +562,20 @@ async function summarizeChatMain(context, force, skipWIAN) {
             await waitUntilCondition(() => is_group_generating === false, 1000, 10);
         }
         // Wait for the send button to be released
-        waitUntilCondition(() => is_send_press === false, 30000, 100);
+        await waitUntilCondition(() => is_send_press === false, 30000, 100);
     } catch {
         console.debug('Timeout waiting for is_send_press');
-        return;
+        return '';
     }
 
     if (!context.chat.length) {
         console.debug('No messages in chat to summarize');
-        return;
+        return '';
     }
 
     if (context.chat.length < extension_settings.memory.promptInterval && !force) {
         console.debug(`Not enough messages in chat to summarize (chat: ${context.chat.length}, interval: ${extension_settings.memory.promptInterval})`);
-        return;
+        return '';
     }
 
     let messagesSinceLastSummary = 0;
@@ -340,18 +599,130 @@ async function summarizeChatMain(context, force, skipWIAN) {
 
     if (!conditionSatisfied && !force) {
         console.debug(`Summary conditions not satisfied (messages: ${messagesSinceLastSummary}, interval: ${extension_settings.memory.promptInterval}, words: ${wordsSinceLastSummary}, force words: ${extension_settings.memory.promptForceWords})`);
-        return;
+        return '';
     }
 
     console.log('Summarizing chat, messages since last summary: ' + messagesSinceLastSummary, 'words since last summary: ' + wordsSinceLastSummary);
-    const prompt = extension_settings.memory.prompt?.replace(/{{words}}/gi, extension_settings.memory.promptWords);
+    const prompt = substituteParamsExtended(extension_settings.memory.prompt, { words: extension_settings.memory.promptWords });
 
     if (!prompt) {
         console.debug('Summarization prompt is empty. Skipping summarization.');
+        return '';
+    }
+
+    return prompt;
+}
+
+async function summarizeChatWebLLM(context, force) {
+    if (!isWebLlmSupported()) {
         return;
     }
+
+    const prompt = await getSummaryPromptForNow(context, force);
+
+    if (!prompt) {
+        return;
+    }
+
+    const { rawPrompt, lastUsedIndex } = await getRawSummaryPrompt(context, prompt);
+
+    if (lastUsedIndex === null || lastUsedIndex === -1) {
+        if (force) {
+            toastr.info('To try again, remove the latest summary.', 'No messages found to summarize');
+        }
+
+        return null;
+    }
+
+    const messages = [
+        { role: 'system', content: prompt },
+        { role: 'user', content: rawPrompt },
+    ];
+
+    const params = {};
+
+    if (extension_settings.memory.overrideResponseLength > 0) {
+        params.max_tokens = extension_settings.memory.overrideResponseLength;
+    }
+
+    try {
+        inApiCall = true;
+        const summary = await generateWebLlmChatPrompt(messages, params);
+        const newContext = getContext();
+
+        if (!summary) {
+            console.warn('Empty summary received');
+            return;
+        }
+
+        // something changed during summarization request
+        if (newContext.groupId !== context.groupId ||
+            newContext.chatId !== context.chatId ||
+            (!newContext.groupId && (newContext.characterId !== context.characterId))) {
+            console.log('Context changed, summary discarded');
+            return;
+        }
+
+        setMemoryContext(summary, true, lastUsedIndex);
+        return summary;
+    } finally {
+        inApiCall = false;
+    }
+}
+
+async function summarizeChatMain(context, force, skipWIAN) {
+    const prompt = await getSummaryPromptForNow(context, force);
+
+    if (!prompt) {
+        return;
+    }
+
     console.log('sending summary prompt');
-    const summary = await generateQuietPrompt(prompt, false, skipWIAN);
+    let summary = '';
+    let index = null;
+
+    if (prompt_builders.DEFAULT === extension_settings.memory.prompt_builder) {
+        try {
+            inApiCall = true;
+            summary = await generateQuietPrompt(prompt, false, skipWIAN, '', '', extension_settings.memory.overrideResponseLength);
+        } finally {
+            inApiCall = false;
+        }
+    }
+
+    if ([prompt_builders.RAW_BLOCKING, prompt_builders.RAW_NON_BLOCKING].includes(extension_settings.memory.prompt_builder)) {
+        const lock = extension_settings.memory.prompt_builder === prompt_builders.RAW_BLOCKING;
+        try {
+            inApiCall = true;
+            if (lock) {
+                deactivateSendButtons();
+            }
+
+            const { rawPrompt, lastUsedIndex } = await getRawSummaryPrompt(context, prompt);
+
+            if (lastUsedIndex === null || lastUsedIndex === -1) {
+                if (force) {
+                    toastr.info('To try again, remove the latest summary.', 'No messages found to summarize');
+                }
+
+                return null;
+            }
+
+            summary = await generateRaw(rawPrompt, '', false, false, prompt, extension_settings.memory.overrideResponseLength);
+            index = lastUsedIndex;
+        } finally {
+            inApiCall = false;
+            if (lock) {
+                activateSendButtons();
+            }
+        }
+    }
+
+    if (!summary) {
+        console.warn('Empty summary received');
+        return;
+    }
+
     const newContext = getContext();
 
     // something changed during summarization request
@@ -362,8 +733,80 @@ async function summarizeChatMain(context, force, skipWIAN) {
         return;
     }
 
-    setMemoryContext(summary, true);
+    setMemoryContext(summary, true, index);
     return summary;
+}
+
+/**
+ * Get the raw summarization prompt from the chat context.
+ * @param {object} context ST context
+ * @param {string} prompt Summarization system prompt
+ * @returns {Promise<{rawPrompt: string, lastUsedIndex: number}>} Raw summarization prompt
+ */
+async function getRawSummaryPrompt(context, prompt) {
+    /**
+     * Get the memory string from the chat buffer.
+     * @param {boolean} includeSystem Include prompt into the memory string
+     * @returns {string} Memory string
+     */
+    function getMemoryString(includeSystem) {
+        const delimiter = '\n\n';
+        const stringBuilder = [];
+        const bufferString = chatBuffer.slice().join(delimiter);
+
+        if (includeSystem) {
+            stringBuilder.push(prompt);
+        }
+
+        if (latestSummary) {
+            stringBuilder.push(latestSummary);
+        }
+
+        stringBuilder.push(bufferString);
+
+        return stringBuilder.join(delimiter).trim();
+    }
+
+    const chat = context.chat.slice();
+    const latestSummary = getLatestMemoryFromChat(chat);
+    const latestSummaryIndex = getIndexOfLatestChatSummary(chat);
+    chat.pop(); // We always exclude the last message from the buffer
+    const chatBuffer = [];
+    const PADDING = 64;
+    const PROMPT_SIZE = await getSourceContextSize();
+    let latestUsedMessage = null;
+
+    for (let index = latestSummaryIndex + 1; index < chat.length; index++) {
+        const message = chat[index];
+
+        if (!message) {
+            break;
+        }
+
+        if (message.is_system || !message.mes) {
+            continue;
+        }
+
+        const entry = `${message.name}:\n${message.mes}`;
+        chatBuffer.push(entry);
+
+        const tokens = await countSourceTokens(getMemoryString(true), PADDING);
+
+        if (tokens > PROMPT_SIZE) {
+            chatBuffer.pop();
+            break;
+        }
+
+        latestUsedMessage = message;
+
+        if (extension_settings.memory.maxMessagesPerRequest > 0 && chatBuffer.length >= extension_settings.memory.maxMessagesPerRequest) {
+            break;
+        }
+    }
+
+    const lastUsedIndex = context.chat.indexOf(latestUsedMessage);
+    const rawPrompt = getMemoryString(false);
+    return { rawPrompt, lastUsedIndex };
 }
 
 async function summarizeChatExtras(context) {
@@ -376,7 +819,7 @@ async function summarizeChatExtras(context) {
     const reversedChat = chat.slice().reverse();
     reversedChat.shift();
     const memoryBuffer = [];
-    const CONTEXT_SIZE = 1024 - 64;
+    const CONTEXT_SIZE = await getSourceContextSize();
 
     for (const message of reversedChat) {
         // we reached the point of latest memory
@@ -394,14 +837,14 @@ async function summarizeChatExtras(context) {
         memoryBuffer.push(entry);
 
         // check if token limit was reached
-        const tokens = getTextTokens(tokenizers.GPT2, getMemoryString()).length;
+        const tokens = await countSourceTokens(getMemoryString());
         if (tokens >= CONTEXT_SIZE) {
             break;
         }
     }
 
     const resultingString = getMemoryString();
-    const resultingTokens = getTextTokens(tokenizers.GPT2, resultingString).length;
+    const resultingTokens = await countSourceTokens(resultingString);
 
     if (!resultingString || resultingTokens < CONTEXT_SIZE) {
         console.debug('Not enough context to summarize');
@@ -411,37 +854,23 @@ async function summarizeChatExtras(context) {
     // perform the summarization API call
     try {
         inApiCall = true;
-        const url = new URL(getApiUrl());
-        url.pathname = '/api/summarize';
+        const summary = await callExtrasSummarizeAPI(resultingString);
+        const newContext = getContext();
 
-        const apiResult = await doExtrasFetch(url, {
-            method: 'POST',
-            headers: {
-                'Content-Type': 'application/json',
-                'Bypass-Tunnel-Reminder': 'bypass',
-            },
-            body: JSON.stringify({
-                text: resultingString,
-                params: {},
-            }),
-        });
-
-        if (apiResult.ok) {
-            const data = await apiResult.json();
-            const summary = data.summary;
-
-            const newContext = getContext();
-
-            // something changed during summarization request
-            if (newContext.groupId !== context.groupId
-                || newContext.chatId !== context.chatId
-                || (!newContext.groupId && (newContext.characterId !== context.characterId))) {
-                console.log('Context changed, summary discarded');
-                return;
-            }
-
-            setMemoryContext(summary, true);
+        if (!summary) {
+            console.warn('Empty summary received');
+            return;
         }
+
+        // something changed during summarization request
+        if (newContext.groupId !== context.groupId
+            || newContext.chatId !== context.chatId
+            || (!newContext.groupId && (newContext.characterId !== context.characterId))) {
+            console.log('Context changed, summary discarded');
+            return;
+        }
+
+        setMemoryContext(summary, true);
     }
     catch (error) {
         console.log(error);
@@ -449,6 +878,40 @@ async function summarizeChatExtras(context) {
     finally {
         inApiCall = false;
     }
+}
+
+/**
+ * Call the Extras API to summarize the provided text.
+ * @param {string} text Text to summarize
+ * @returns {Promise<string>} Summarized text
+ */
+async function callExtrasSummarizeAPI(text) {
+    if (!modules.includes('summarize')) {
+        throw new Error('Summarize module is not enabled in Extras API');
+    }
+
+    const url = new URL(getApiUrl());
+    url.pathname = '/api/summarize';
+
+    const apiResult = await doExtrasFetch(url, {
+        method: 'POST',
+        headers: {
+            'Content-Type': 'application/json',
+            'Bypass-Tunnel-Reminder': 'bypass',
+        },
+        body: JSON.stringify({
+            text: text,
+            params: {},
+        }),
+    });
+
+    if (apiResult.ok) {
+        const data = await apiResult.json();
+        const summary = data.summary;
+        return summary;
+    }
+
+    throw new Error('Extras API call failed');
 }
 
 function onMemoryRestoreClick() {
@@ -473,21 +936,35 @@ function onMemoryContentInput() {
     setMemoryContext(value, true);
 }
 
+function onMemoryPromptBuilderInput(e) {
+    const value = Number(e.target.value);
+    extension_settings.memory.prompt_builder = value;
+    saveSettingsDebounced();
+}
+
 function reinsertMemory() {
-    const existingValue = $('#memory_contents').val();
+    const existingValue = String($('#memory_contents').val());
     setMemoryContext(existingValue, false);
 }
 
-function setMemoryContext(value, saveToMessage) {
-    const context = getContext();
-    context.setExtensionPrompt(MODULE_NAME, formatMemoryValue(value), extension_settings.memory.position, extension_settings.memory.depth);
+/**
+ * Set the summary value to the context and save it to the chat message extra.
+ * @param {string} value Value of a summary
+ * @param {boolean} saveToMessage Should the summary be saved to the chat message extra
+ * @param {number|null} index Index of the chat message to save the summary to. If null, the pre-last message is used.
+ */
+function setMemoryContext(value, saveToMessage, index = null) {
+    setExtensionPrompt(MODULE_NAME, formatMemoryValue(value), extension_settings.memory.position, extension_settings.memory.depth, extension_settings.memory.scan, extension_settings.memory.role);
     $('#memory_contents').val(value);
-    console.log('Summary set to: ' + value);
-    console.debug('Position: ' + extension_settings.memory.position);
-    console.debug('Depth: ' + extension_settings.memory.depth);
 
+    const summaryLog = value
+        ? `Summary set to: ${value}. Position: ${extension_settings.memory.position}. Depth: ${extension_settings.memory.depth}. Role: ${extension_settings.memory.role}`
+        : 'Summary has no content';
+    console.debug(summaryLog);
+
+    const context = getContext();
     if (saveToMessage && context.chat.length) {
-        const idx = context.chat.length - 2;
+        const idx = index ?? context.chat.length - 2;
         const mes = context.chat[idx < 0 ? 0 : idx];
 
         if (!mes.extra) {
@@ -557,99 +1034,31 @@ function setupListeners() {
     $('#memory_prompt_words').off('click').on('input', onMemoryPromptWordsInput);
     $('#memory_prompt_interval').off('click').on('input', onMemoryPromptIntervalInput);
     $('#memory_prompt').off('click').on('input', onMemoryPromptInput);
-    $('#memory_force_summarize').off('click').on('click', forceSummarizeChat);
+    $('#memory_force_summarize').off('click').on('click', () => forceSummarizeChat(false));
     $('#memory_template').off('click').on('input', onMemoryTemplateInput);
     $('#memory_depth').off('click').on('input', onMemoryDepthInput);
+    $('#memory_role').off('click').on('input', onMemoryRoleInput);
     $('input[name="memory_position"]').off('click').on('change', onMemoryPositionChange);
     $('#memory_prompt_words_force').off('click').on('input', onMemoryPromptWordsForceInput);
+    $('#memory_prompt_builder_default').off('click').on('input', onMemoryPromptBuilderInput);
+    $('#memory_prompt_builder_raw_blocking').off('click').on('input', onMemoryPromptBuilderInput);
+    $('#memory_prompt_builder_raw_non_blocking').off('click').on('input', onMemoryPromptBuilderInput);
+    $('#memory_prompt_restore').off('click').on('click', onMemoryPromptRestoreClick);
+    $('#memory_prompt_interval_auto').off('click').on('click', onPromptIntervalAutoClick);
+    $('#memory_prompt_words_auto').off('click').on('click', onPromptForceWordsAutoClick);
+    $('#memory_override_response_length').off('click').on('input', onOverrideResponseLengthInput);
+    $('#memory_max_messages_per_request').off('click').on('input', onMaxMessagesPerRequestInput);
+    $('#memory_include_wi_scan').off('input').on('input', onMemoryIncludeWIScanInput);
     $('#summarySettingsBlockToggle').off('click').on('click', function () {
         console.log('saw settings button click');
         $('#summarySettingsBlock').slideToggle(200, 'swing'); //toggleClass("hidden");
     });
 }
 
-jQuery(function () {
-    function addExtensionControls() {
-        const settingsHtml = `
-        <div id="memory_settings">
-            <div class="inline-drawer">
-                <div class="inline-drawer-toggle inline-drawer-header">
-                    <div class="flex-container alignitemscenter margin0"><b>Summarize</b><i id="summaryExtensionPopoutButton" class="fa-solid fa-window-restore menu_button margin0"></i></div>
-                    <div class="inline-drawer-icon fa-solid fa-circle-chevron-down down"></div>
-                </div>
-                <div class="inline-drawer-content">
-                    <div id="summaryExtensionDrawerContents">
-                        <label for="summary_source">Summarize with:</label>
-                        <select id="summary_source">
-                            <option value="main">Main API</option>
-                            <option value="extras">Extras API</option>
-                        </select><br>
-
-                        <div class="flex-container justifyspacebetween alignitemscenter">
-                            <span class="flex1">Current summary:</span>
-                            <div id="memory_restore" class="menu_button flex1 margin0"><span>Restore Previous</span></div>
-                        </div>
-
-                        <textarea id="memory_contents" class="text_pole textarea_compact" rows="6" placeholder="Summary will be generated here..."></textarea>
-                        <div class="memory_contents_controls">
-                            <div id="memory_force_summarize" data-source="main" class="menu_button menu_button_icon" title="Trigger a summary update right now." data-i18n="Trigger a summary update right now.">
-                                <i class="fa-solid fa-database"></i>
-                                <span>Summarize now</span>
-                            </div>
-                            <label for="memory_frozen" title="Disable automatic summary updates. While paused, the summary remains as-is. You can still force an update by pressing the Summarize now button (which is only available with the Main API)." data-i18n="[title]Disable automatic summary updates. While paused, the summary remains as-is. You can still force an update by pressing the Summarize now button (which is only available with the Main API)."><input id="memory_frozen" type="checkbox" />Pause</label>
-                            <label for="memory_skipWIAN" title="Omit World Info and Author's Note from text to be summarized. Only has an effect when using the Main API. The Extras API always omits WI/AN." data-i18n="[title]Omit World Info and Author's Note from text to be summarized. Only has an effect when using the Main API. The Extras API always omits WI/AN."><input id="memory_skipWIAN" type="checkbox" />No WI/AN</label>
-                        </div>
-                        <div class="memory_contents_controls">
-                            <div id="summarySettingsBlockToggle" class="menu_button menu_button_icon" title="Edit summarization prompt, insertion position, etc.">
-                                <i class="fa-solid fa-cog"></i>
-                                <span>Summary Settings</span>
-                            </div>
-                        </div>
-                        <div id="summarySettingsBlock" style="display:none;">
-                            <div class="memory_template">
-                                <label for="memory_template">Insertion Template</label>
-                                <textarea id="memory_template" class="text_pole textarea_compact" rows="2" placeholder="{{summary}} will resolve to the current summary contents."></textarea>
-                            </div>
-                            <label for="memory_position">Injection Position</label>
-                            <div class="radio_group">
-                                <label>
-                                    <input type="radio" name="memory_position" value="2" />
-                                    Before Main Prompt / Story String
-                                </label>
-                                <label>
-                                    <input type="radio" name="memory_position" value="0" />
-                                    After Main Prompt / Story String
-                                </label>
-                                <label for="memory_depth" title="How many messages before the current end of the chat." data-i18n="[title]How many messages before the current end of the chat.">
-                                    <input type="radio" name="memory_position" value="1" />
-                                    In-chat @ Depth <input id="memory_depth" class="text_pole widthUnset" type="number" min="0" max="999" />
-                                </label>
-                            </div>
-                            <div data-source="main" class="memory_contents_controls">
-                            </div>
-                            <div data-source="main">
-                                <label for="memory_prompt" class="title_restorable">
-                                    Summary Prompt
-
-                                </label>
-                                <textarea id="memory_prompt" class="text_pole textarea_compact" rows="6" placeholder="This prompt will be sent to AI to request the summary generation. {{words}} will resolve to the 'Number of words' parameter."></textarea>
-                                <label for="memory_prompt_words">Summary length (<span id="memory_prompt_words_value"></span> words)</label>
-                                <input id="memory_prompt_words" type="range" value="${defaultSettings.promptWords}" min="${defaultSettings.promptMinWords}" max="${defaultSettings.promptMaxWords}" step="${defaultSettings.promptWordsStep}" />
-                                <label for="memory_prompt_interval">Update every <span id="memory_prompt_interval_value"></span> messages</label>
-                                <small>0 = disable</small>
-                                <input id="memory_prompt_interval" type="range" value="${defaultSettings.promptInterval}" min="${defaultSettings.promptMinInterval}" max="${defaultSettings.promptMaxInterval}" step="${defaultSettings.promptIntervalStep}" />
-                                <label for="memory_prompt_words_force">Update every <span id="memory_prompt_words_force_value"></span> words</label>
-                                <small>0 = disable</small>
-                                <input id="memory_prompt_words_force" type="range" value="${defaultSettings.promptForceWords}" min="${defaultSettings.promptMinForceWords}" max="${defaultSettings.promptMaxForceWords}" step="${defaultSettings.promptForceWordsStep}" />
-                                <small>If both sliders are non-zero, then both will trigger summary updates a their respective intervals.</small>
-                            </div>
-                        </div>
-                    </div>
-                </div>
-            </div>
-        </div>
-        `;
-        $('#extensions_settings2').append(settingsHtml);
+jQuery(async function () {
+    async function addExtensionControls() {
+        const settingsHtml = await renderExtensionTemplateAsync('memory', 'settings', { defaultSettings });
+        $('#summarize_container').append(settingsHtml);
         setupListeners();
         $('#summaryExtensionPopoutButton').off('click').on('click', function (e) {
             doPopout(e);
@@ -657,12 +1066,38 @@ jQuery(function () {
         });
     }
 
-    addExtensionControls();
+    await addExtensionControls();
     loadSettings();
-    eventSource.on(event_types.MESSAGE_RECEIVED, onChatEvent);
+    eventSource.makeLast(event_types.CHARACTER_MESSAGE_RENDERED, onChatEvent);
     eventSource.on(event_types.MESSAGE_DELETED, onChatEvent);
     eventSource.on(event_types.MESSAGE_EDITED, onChatEvent);
     eventSource.on(event_types.MESSAGE_SWIPED, onChatEvent);
     eventSource.on(event_types.CHAT_CHANGED, onChatEvent);
-    registerSlashCommand('summarize', forceSummarizeChat, [], '– forces the summarization of the current chat using the Main API', true, true);
+    SlashCommandParser.addCommandObject(SlashCommand.fromProps({
+        name: 'summarize',
+        callback: summarizeCallback,
+        namedArgumentList: [
+            new SlashCommandNamedArgument('source', 'API to use for summarization', [ARGUMENT_TYPE.STRING], false, false, '', Object.values(summary_sources)),
+            SlashCommandNamedArgument.fromProps({
+                name: 'prompt',
+                description: 'prompt to use for summarization',
+                typeList: [ARGUMENT_TYPE.STRING],
+                defaultValue: '',
+            }),
+            SlashCommandNamedArgument.fromProps({
+                name: 'quiet',
+                description: 'suppress the toast message when summarizing the chat',
+                typeList: [ARGUMENT_TYPE.BOOLEAN],
+                defaultValue: 'false',
+                enumList: commonEnumProviders.boolean('trueFalse')(),
+            }),
+        ],
+        unnamedArgumentList: [
+            new SlashCommandArgument('text to summarize', [ARGUMENT_TYPE.STRING], false, false, ''),
+        ],
+        helpString: 'Summarizes the given text. If no text is provided, the current chat will be summarized. Can specify the source and the prompt to use.',
+        returns: ARGUMENT_TYPE.STRING,
+    }));
+
+    MacrosParser.registerMacro('summary', () => getLatestMemoryFromChat(getContext().chat));
 });

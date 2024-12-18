@@ -1,4 +1,5 @@
-import { getRequestHeaders, callPopup } from '../../../script.js';
+import { getRequestHeaders } from '../../../script.js';
+import { POPUP_TYPE, callGenericPopup } from '../../popup.js';
 import { splitRecursive } from '../../utils.js';
 import { getPreviewString, saveTtsProviderSettings } from './index.js';
 import { initVoiceMap } from './index.js';
@@ -28,6 +29,8 @@ class NovelTtsProvider {
     processText(text) {
         // Novel reads tilde as a word. Replace with full stop
         text = text.replace(/~/g, '.');
+        // Novel reads asterisk as a word. Remove it
+        text = text.replace(/\*/g, '');
         return text;
     }
 
@@ -54,7 +57,7 @@ class NovelTtsProvider {
 
     // Add a new Novel custom voice to provider
     async addCustomVoice() {
-        const voiceName = await callPopup('<h3>Custom Voice name:</h3>', 'input');
+        const voiceName = await callGenericPopup('Custom Voice name:',  POPUP_TYPE.INPUT);
         this.settings.customVoices.push(voiceName);
         this.populateCustomVoices();
         initVoiceMap(); // Update TTS extension voiceMap
@@ -178,6 +181,7 @@ class NovelTtsProvider {
         const url = URL.createObjectURL(audio);
         this.audioElement.src = url;
         this.audioElement.play();
+        this.audioElement.onended = () => URL.revokeObjectURL(url);
     }
 
     async* fetchTtsGeneration(inputText, voiceId) {
